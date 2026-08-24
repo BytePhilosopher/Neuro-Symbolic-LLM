@@ -1,0 +1,79 @@
+# ==========================================================================
+# Stage A1 — SMOKE TEST configuration
+# ==========================================================================
+# Same code path as a1_lora_baseline.yaml, but with a randomly-initialised tiny
+# transformer and a synthetic random-token dataset, so the full pipeline
+# (config -> frozen base -> hook adapter -> loss -> backward -> step -> eval ->
+# checkpoint) runs in seconds with no network access.
+#
+# EVERY value in this file is a TEMPORARY SMOKE-TEST SETTING. This config
+# produces no research results.
+# ==========================================================================
+
+stage: A1
+
+model:
+  name_or_path: synthetic-tiny-gpt-neox  # TEMPORARY SMOKE-TEST SETTING — label only; `model.synthetic` below is what builds the model
+  task: causal_lm                        # TEMPORARY SMOKE-TEST SETTING
+  dtype: float32                         # TEMPORARY SMOKE-TEST SETTING
+  synthetic:                             # TEMPORARY SMOKE-TEST SETTING — when set, no checkpoint is downloaded
+    num_hidden_layers: 2
+    hidden_size: 32
+    num_attention_heads: 4
+    intermediate_size: 64
+    vocab_size: 128
+    max_position_embeddings: 64
+
+adapter:
+  type: lora_residual                    # REQUIRED BY RESEARCH PLAN (mechanism is identical to the real run)
+  rank: 4                                # TEMPORARY SMOKE-TEST SETTING
+  alpha: 8.0                             # TEMPORARY SMOKE-TEST SETTING
+  dropout: 0.0                           # TEMPORARY SMOKE-TEST SETTING
+  activation: gelu                       # TEMPORARY SMOKE-TEST SETTING
+  target_layers: [-1]                    # TEMPORARY SMOKE-TEST SETTING
+
+training:
+  seed: 0                                # TEMPORARY SMOKE-TEST SETTING
+  learning_rate: 5.0e-3                  # TEMPORARY SMOKE-TEST SETTING — deliberately large so the loss visibly moves in a few steps
+  batch_size: 4                          # TEMPORARY SMOKE-TEST SETTING
+  gradient_accumulation_steps: 1          # TEMPORARY SMOKE-TEST SETTING
+  epochs: 2                              # TEMPORARY SMOKE-TEST SETTING
+  max_steps: 6                           # TEMPORARY SMOKE-TEST SETTING
+  weight_decay: 0.01                     # TEMPORARY SMOKE-TEST SETTING
+  lambda_kl: 0.1                         # TEMPORARY SMOKE-TEST SETTING
+  warmup_ratio: 0.0                      # TEMPORARY SMOKE-TEST SETTING
+  max_grad_norm: 1.0                     # TEMPORARY SMOKE-TEST SETTING
+  log_every: 1                           # TEMPORARY SMOKE-TEST SETTING
+  freeze_check_every: 1                  # TEMPORARY SMOKE-TEST SETTING — check freezing on every step
+
+data:
+  dataset: synthetic                     # TEMPORARY SMOKE-TEST SETTING — label only; `data.synthetic` below is what builds the splits
+  dataset_config: null                   # TEMPORARY SMOKE-TEST SETTING
+  max_length: 24                         # TEMPORARY SMOKE-TEST SETTING
+  max_train_examples: null               # TEMPORARY SMOKE-TEST SETTING
+  max_eval_examples: null                # TEMPORARY SMOKE-TEST SETTING
+  num_workers: 0                         # TEMPORARY SMOKE-TEST SETTING
+  synthetic:                             # TEMPORARY SMOKE-TEST SETTING — variable-length random token sequences
+    num_train: 24
+    num_validation: 8
+    num_test: 0
+    min_length: 8
+    max_length: 24
+
+evaluation:
+  eval_every: 3                          # TEMPORARY SMOKE-TEST SETTING
+  save_every: null                       # TEMPORARY SMOKE-TEST SETTING
+  kl_anchor_batches: 2                   # TEMPORARY SMOKE-TEST SETTING
+  latency_batch_size: 1                  # TEMPORARY SMOKE-TEST SETTING
+  latency_sequence_length: 16            # TEMPORARY SMOKE-TEST SETTING
+  latency_warmup_iters: 1                # TEMPORARY SMOKE-TEST SETTING
+  latency_measure_iters: 3               # TEMPORARY SMOKE-TEST SETTING
+  spectral_energy_ranks: [1, 2, 4, 8, 16]  # TEMPORARY SMOKE-TEST SETTING
+
+output:
+  directory: runs/stage_A                # TEMPORARY SMOKE-TEST SETTING
+  run_name: a1_smoke                     # TEMPORARY SMOKE-TEST SETTING
+  save_checkpoint: true                  # TEMPORARY SMOKE-TEST SETTING
+
+hardware:
+  device: cpu                            # TEMPORARY SMOKE-TEST SETTING

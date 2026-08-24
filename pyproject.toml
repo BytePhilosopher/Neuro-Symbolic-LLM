@@ -58,8 +58,9 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-where = ["."]
+where = [".", "src"]
 include = [
+    "neurosymbolic*",
     "fabricpc_ext*",
     "nac*",
     "tier2_mork*",
@@ -103,6 +104,7 @@ ignore = [
 [tool.ruff.lint.isort]
 # tells ruff which packages are "yours" so imports are sorted into the right group
 known-first-party = [
+    "neurosymbolic",
     "fabricpc_ext",
     "nac",
     "tier2_mork",
@@ -126,6 +128,7 @@ ignore_missing_imports = true   # JAX and FabricPC stubs are incomplete
 # ── Pytest ─────────────────────────────────────────────────────────────────
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src", "."]
 asyncio_mode = "auto"
 filterwarnings = [
     "ignore::DeprecationWarning",

@@ -1,0 +1,76 @@
+# ==========================================================================
+# Stage A1 — Ordinary residual baseline (LoRA-style hidden-state residual)
+# ==========================================================================
+#
+#   F(x) = F0(x) + R_phi(x)         F0 frozen, phi = adapter parameters only
+#   h~_l = h0_l + R_phi,l(h0_l)     R_phi,l(h) = B_l sigma(A_l h)
+#
+#   L_A1 = L_task + lambda_KL * KL(p_base || p_adapted) + lambda_wd * ||phi||^2
+#
+# NO predictive coding. NO symbolic head. Ordinary backpropagation only.
+#
+# Provenance tags used below:
+#   REQUIRED BY RESEARCH PLAN  — comes from the A1 research definition
+#   ENGINEERING CHOICE         — our decision, made for reproducibility/speed
+#   TEMPORARY SMOKE-TEST SETTING — only for the fast synthetic pipeline check
+# ==========================================================================
+
+stage: A1
+
+model:
+  name_or_path: EleutherAI/pythia-160m   # ENGINEERING CHOICE (research plan only requires a 50M-350M frozen transformer)
+  task: causal_lm                        # ENGINEERING CHOICE (plan is task-agnostic; one clean task at A1)
+  dtype: float32                         # ENGINEERING CHOICE (fp32 is safe on CPU; KL is computed in fp32 regardless)
+
+adapter:
+  type: lora_residual                    # REQUIRED BY RESEARCH PLAN — low-rank residual on the HIDDEN STATE, via forward hook. NOT `peft` LoRA, NOT a weight reparameterisation.
+  rank: 8                                # ENGINEERING CHOICE (middle of the 4/8/16 sweep)
+  alpha: 16.0                            # ENGINEERING CHOICE (scaling = alpha/rank keeps output scale comparable across the sweep)
+  dropout: 0.0                           # ENGINEERING CHOICE (no regularisation beyond the plan's KL + weight decay)
+  activation: gelu                       # REQUIRED BY RESEARCH PLAN that a nonlinearity sigma exists; gelu specifically is an ENGINEERING CHOICE
+  target_layers: [-1]                    # REQUIRED BY RESEARCH PLAN that layers are selectable; -1 (last decoder layer) is an ENGINEERING CHOICE
+
+training:
+  seed: 42                               # ENGINEERING CHOICE — seeds model init, adapter init AND dataloader shuffle
+  learning_rate: 1.0e-3                  # ENGINEERING CHOICE (adapter-only training tolerates a higher LR than full fine-tuning)
+  batch_size: 8                          # ENGINEERING CHOICE
+  gradient_accumulation_steps: 1          # ENGINEERING CHOICE
+  epochs: 1                              # ENGINEERING CHOICE
+  max_steps: 200                         # ENGINEERING CHOICE (small budget; held constant across the rank sweep)
+  weight_decay: 0.01                     # REQUIRED BY RESEARCH PLAN (lambda_wd ||phi||^2) — applied by AdamW, NOT added to the loss, to avoid double-counting
+  lambda_kl: 0.1                         # REQUIRED BY RESEARCH PLAN that the KL term exists; the value 0.1 is an ENGINEERING CHOICE
+  warmup_ratio: 0.06                     # ENGINEERING CHOICE (linear warmup then linear decay)
+  max_grad_norm: 1.0                     # ENGINEERING CHOICE
+  log_every: 20                          # ENGINEERING CHOICE
+  freeze_check_every: 25                 # ENGINEERING CHOICE — periodic assertion that base params carry no gradient
+
+data:
+  dataset: wikitext                      # ENGINEERING CHOICE (pinned for reproducibility; plan does not name a dataset)
+  dataset_config: wikitext-2-raw-v1      # ENGINEERING CHOICE
+  text_column: text                      # ENGINEERING CHOICE
+  train_split: train                     # ENGINEERING CHOICE
+  validation_split: validation           # ENGINEERING CHOICE
+  test_split: null                       # ENGINEERING CHOICE (optional; unused at A1)
+  max_length: 256                        # ENGINEERING CHOICE
+  min_characters: 32                     # ENGINEERING CHOICE — drops wikitext blank lines and bare section headings
+  max_train_examples: 4000               # ENGINEERING CHOICE (keeps the run CPU-feasible)
+  max_eval_examples: 256                 # ENGINEERING CHOICE
+  num_workers: 0                         # ENGINEERING CHOICE (deterministic ordering)
+
+evaluation:
+  eval_every: 100                        # ENGINEERING CHOICE
+  save_every: null                       # ENGINEERING CHOICE (single checkpoint at end of run)
+  kl_anchor_batches: 8                   # ENGINEERING CHOICE — fixed anchor subset for the KL-drift evaluator
+  latency_batch_size: 1                  # ENGINEERING CHOICE
+  latency_sequence_length: 128           # ENGINEERING CHOICE
+  latency_warmup_iters: 3                # ENGINEERING CHOICE
+  latency_measure_iters: 10              # ENGINEERING CHOICE
+  spectral_energy_ranks: [1, 2, 4, 8, 16]  # ENGINEERING CHOICE — ranks above a matrix's actual rank are skipped
+
+output:
+  directory: runs/stage_A/a1             # ENGINEERING CHOICE (relative to the repository root; no absolute paths)
+  run_name: a1_lora_baseline_r8          # ENGINEERING CHOICE
+  save_checkpoint: true                  # ENGINEERING CHOICE — saves adapter weights only, never base weights
+
+hardware:
+  device: auto                           # ENGINEERING CHOICE (cuda -> mps -> cpu)
