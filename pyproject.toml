@@ -71,6 +71,9 @@ include = [
     "tiers*",
     "symbolic_pipeline*",
     "substrate*",
+    "residual*",
+    "stages*",
+    "metrics*",
 ]
 
 # ── Black ──────────────────────────────────────────────────────────────────
@@ -117,6 +120,9 @@ known-first-party = [
     "tier3",
     "tiers",
     "symbolic_pipeline",
+    "residual",
+    "stages",
+    "metrics",
 ]
 
 # ── Mypy ───────────────────────────────────────────────────────────────────

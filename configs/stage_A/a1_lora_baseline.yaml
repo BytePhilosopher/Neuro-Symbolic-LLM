@@ -1,0 +1,24 @@
+# Hidden-state residual adapter (not weight-level LoRA). See architecture.md.
+# Keys mirror ResidualConfig / A1Config / TrainingConfig; unknown keys are rejected.
+adapter:
+  rank: 16
+  activation: identity  # identity | gelu | relu | tanh
+  alpha: null           # null → scale 1.0, else alpha / rank
+  init_std: null        # null → 1/sqrt(d)
+  late_start: null      # null → L//2 + 1
+  late_end: null        # null → L - 2
+  seed: 0
+objective:
+  lambda_kl: 0.0        # [team] default, to be swept; KL is always logged
+  lambda_wd: 0.0
+training:
+  model: gpt2
+  dataset: Salesforce/wikitext
+  dataset_config: wikitext-2-raw-v1
+  seq_len: 128
+  batch_size: 8
+  steps: 200
+  learning_rate: 1.0e-3
+  eval_batches: 8
+  log_every: 10
+  seed: 0

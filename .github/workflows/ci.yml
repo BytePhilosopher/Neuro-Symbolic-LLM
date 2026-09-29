@@ -103,6 +103,9 @@ jobs:
             echo "No unit tests found. Skipping."
           fi
 
+      - name: Run Stage A1 tests
+        run: pytest tests/residual/ tests/stage_A/ -v --tb=short
+
       - name: Run grammar integration tests
         run: |
           if [ -f "tests/unit/test_atomese.py" ]; then
