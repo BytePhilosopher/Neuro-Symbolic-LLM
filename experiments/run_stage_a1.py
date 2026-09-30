@@ -25,6 +25,7 @@ import optax
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+# Run as a script, so the repo root is not on sys.path by default.
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -102,6 +103,8 @@ def load_token_blocks(
     if substrate.tokenizer is None:
         raise ValueError(f"No tokenizer available for {cfg.model!r}.")
     texts = load_dataset(cfg.dataset, cfg.dataset_config, split=split)["text"]
+    # WikiText lines keep their trailing newlines, so a plain join gives one
+    # contiguous token stream; the ragged tail is dropped.
     ids = substrate.tokenizer("".join(texts), return_tensors="np")["input_ids"][0]
     n = len(ids) // cfg.seq_len
     if n == 0:
@@ -114,6 +117,7 @@ def batches(blocks: np.ndarray, batch_size: int, seed: int) -> Iterator[jax.Arra
     rng = np.random.default_rng(seed)
     while True:
         order = rng.permutation(len(blocks))
+        # The last partial batch is dropped to keep batch shapes static.
         for i in range(0, len(order) - batch_size + 1, batch_size):
             yield jnp.asarray(blocks[order[i : i + batch_size]])
 
@@ -200,6 +204,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     train_blocks = load_token_blocks(substrate, train_cfg, "train")
     eval_blocks = load_token_blocks(substrate, train_cfg, "validation")
+    # Fixed, unshuffled eval batches so eval@init and eval@end are comparable.
     n_eval = min(len(eval_blocks), train_cfg.eval_batches * train_cfg.batch_size)
     eval_set = [
         jnp.asarray(eval_blocks[i : i + train_cfg.batch_size])
@@ -208,6 +213,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     log.info("train_blocks=%d eval_batches=%d", len(train_blocks), len(eval_set))
     log.info("eval@init %s", evaluate(substrate, adapter, params, eval_set))
 
+    # The optimizer only ever sees the adapter PyTree; base weights are torch
+    # tensors outside it and cannot be updated.
     optimizer = optax.adam(train_cfg.learning_rate)
     opt_state = optimizer.init(params)
     grad_fn = jax.value_and_grad(a1_objective, has_aux=True)
@@ -216,6 +223,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     for step in range(1, train_cfg.steps + 1):
         ids = next(stream)
         start = time.perf_counter()
+        # No precomputed base: a1_objective runs the base forward itself, so each
+        # step costs two substrate forwards.
         (_, terms), grads = grad_fn(
             params,
             substrate=substrate,
@@ -225,6 +234,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
+        # JAX dispatches asynchronously; wait so step_time measures the real work.
         jax.block_until_ready(params)
         step_time = time.perf_counter() - start
         if step % train_cfg.log_every == 0 or step in (1, train_cfg.steps):

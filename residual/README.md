@@ -1,128 +1,207 @@
-# Neuro-Symbolic-LLM — Hidden-State Residual Adapter
+# Stage A1 — Hidden-State Residual Adapter
 
-A trainable low-rank **hidden-state residual** inserted at the late blocks of a frozen `FrozenSubstrate` (see [`frozenllm/README.md`](../frozenllm/README.md)). It is the only trainable component in Stage A1. It is **not** weight-level LoRA: it changes block outputs, never the base weights ($\nabla \theta_0 = 0$).
+Stage A1 is the baseline for adapting a frozen language model: a small, trainable, low-rank residual is added to the hidden states of the model's late blocks, and only that residual is trained. The base model is wrapped in a [`FrozenSubstrate`](../frozenllm/README.md) and never changes.
 
-Provides late-layer selection with strict bound validation, zero-residual initialisation (the adapted model equals the base at step 0), a parameter PyTree independent of `substrate.params`, and a `modify_fn` that plugs into `FrozenSubstrate.run_with_interception`.
-
----
-
-## Table of Contents
-
-1. [Architectural Overview](#architectural-overview)
-2. [Implementation Design & Data Flow](#implementation-design--data-flow)
-3. [File Breakdown](#file-breakdown)
-4. [Test Suite Documentation](#test-suite-documentation)
-5. [Installation & Requirements](#installation--requirements)
-6. [How to Run](#how-to-run)
-   - [Run the Stage A1 runner](#1-run-the-stage-a1-runner)
-   - [Run the test suites](#2-run-tests)
-   - [Run pre-commit / lint checks](#3-code-quality-checks)
-   - [Quickstart: use ResidualAdapter in Python](#4-quickstart-python-example)
-7. [Core Architectural Guarantees](#core-architectural-guarantees)
+The adapter is **not** weight-level LoRA. It modifies block *outputs* at inference time; the base weights receive no gradient ($\nabla \theta_0 = 0$).
 
 ---
 
-## Architectural Overview
+## Contents
 
-1. **Residual Map:** At each adapted block $l$, the frozen block output $h_l$ (row vectors of size $d$) is replaced by
-
-   $$\tilde h_l = h_l + s \cdot \sigma(h_l A_l)\, B_l, \qquad A_l \in \mathbb{R}^{d \times r},\ B_l \in \mathbb{R}^{r \times d}$$
-
-   with $s = \alpha / r$, or $1.0$ when `alpha` is `None` (`ResidualConfig.scale`).
-2. **Activations:** $\sigma \in$ {`identity` (default), `gelu`, `relu`, `tanh`} (`ACTIVATIONS`). With `identity`, the residual is a sum of $r$ rank-one read/write atoms.
-3. **Precision:** The residual is computed in float32 and cast back to the dtype of $h_l$ before the addition.
-4. **Late-Layer Selection:** With $L$ = `architecture.num_layers` (blocks $0 \dots L-1$), the adapted blocks are the late layers strictly after the midpoint, $(L/\!/2,\ L-2]$. Block $L-1$ is never adapted.
-
-   | $L$ | $L/\!/2$ | adapted blocks |
-   |---|---|---|
-   | 12 | 6 | 7 … 10 |
-   | 24 | 12 | 13 … 22 |
-   | 32 | 16 | 17 … 30 |
-
-   `late_start` / `late_end` replace the defaults $L/\!/2 + 1$ and $L-2$ (both inclusive). `resolve_late_layers` raises `ValueError` if $L < 4$ or if $L/\!/2 <$ `late_start` $\le$ `late_end` $\le L-2$ does not hold; the message gives the depth, the requested bounds and the valid range. Bounds are never clamped.
-5. **Zero-Residual Initialisation:** $A_l \sim \mathcal{N}(0, 1/d)$ (std $1/\sqrt{d}$, overridable with `init_std`) and $B_l = 0$, so the adapted model equals the base model at step 0. `init_params()` is deterministic in `seed`.
-6. **Independent Parameter PyTree:** `{"layer_7": {"A": f32[d, r], "B": f32[r, d]}, ..., "layer_10": {...}}`, keyed by `layer_key(idx)`. Size is $2 \cdot d \cdot r \cdot |\text{layers}|$; for GPT-2 small ($d = 768$, $r = 16$, blocks 7…10) that is 98,304.
-7. **Single Integration Point:** The adapter is built from `substrate.architecture` only. `modify_fn(params)` returns a substrate `ModifyFn` `(hidden, layer_idx) -> hidden`; blocks without an entry pass through unchanged.
+- [Overview](#overview)
+- [The Adapter](#the-adapter)
+- [The A1 Objective](#the-a1-objective)
+- [Training Loop](#training-loop)
+- [Code Layout](#code-layout)
+- [API](#api)
+- [Configuration](#configuration)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Testing](#testing)
+- [Guarantees](#guarantees)
 
 ---
 
-## Implementation Design & Data Flow
+## Overview
+
+| | |
+|---|---|
+| **Base model** | Frozen (GPT-2 by default), run through `FrozenSubstrate` |
+| **Trainable part** | Low-rank residual on late blocks, $2 \cdot d \cdot r$ parameters per block |
+| **Objective** | Next-token cross-entropy, optional KL to the base model, optional weight decay |
+| **Data** | WikiText-2 (`Salesforce/wikitext`, `wikitext-2-raw-v1`) |
+| **Optimizer** | `optax.adam`, over the adapter parameters only |
+| **Starting point** | Identical to the base model (zero residual at step 0) |
+
+---
+
+## The Adapter
+
+### Residual
+
+At each adapted block $l$, the frozen output $h_l \in \mathbb{R}^{d}$ is replaced by:
+
+$$\tilde h_l = h_l + s \cdot \sigma(h_l A_l)\, B_l, \qquad A_l \in \mathbb{R}^{d \times r},\ B_l \in \mathbb{R}^{r \times d}$$
+
+| Symbol | Meaning |
+|---|---|
+| $r$ | Rank (`rank`) |
+| $s$ | Scale: $\alpha / r$, or $1.0$ when `alpha` is `null` |
+| $\sigma$ | Activation: `identity` (default), `gelu`, `relu` or `tanh` |
+
+The residual is computed in float32, so the rank-$r$ bottleneck keeps its precision on bf16/fp16 models, and is cast back to the dtype of $h_l$ before the addition.
+
+### Layer Selection
+
+For a model with $L$ blocks ($0 \dots L-1$), the adapter targets the late blocks $(L/\!/2,\ L-2]$. The final block is never adapted.
+
+| $L$ | Adapted blocks |
+|---|---|
+| 12 (GPT-2 small) | 7 – 10 |
+| 24 | 13 – 22 |
+| 32 | 17 – 30 |
+
+`late_start` and `late_end` (both inclusive) override the defaults. Invalid bounds, or $L < 4$, raise `ValueError` with the valid range. Bounds are never clamped.
+
+### Initialisation
+
+- $A_l \sim \mathcal{N}(0, 1/d)$ (override with `init_std`) and $B_l = 0$.
+- Because $B_l = 0$, the residual is exactly zero and the adapted model equals the base model at step 0. The gradient with respect to $B_l$ is still non-zero, so training starts immediately; $A_l$ begins to receive gradient once $B_l$ moves.
+- Initialisation is deterministic in `seed`. Random keys are derived from the block index, so a block's $A_l$ does not change when the layer range is moved.
+
+### Parameters
+
+The parameters form a PyTree that is fully separate from the substrate's weights:
+
+```python
+{"layer_7": {"A": f32[d, r], "B": f32[r, d]}, ..., "layer_10": {...}}
+```
+
+For GPT-2 small ($d = 768$, $r = 16$, blocks 7–10) this is **98,304** trainable parameters.
+
+---
+
+## The A1 Objective
+
+Implemented in [`stages/stage_A/a1.py`](../stages/stage_A/a1.py):
+
+$$\mathcal{L}_{A1} = \mathcal{L}_{\text{task}} + \lambda_{\text{kl}} \cdot \mathrm{KL}\big(p_{F_0} \,\|\, p_{F_0 + R}\big) + \lambda_{\text{wd}} \cdot \lVert\phi\rVert^2$$
+
+| Term | Description |
+|---|---|
+| $\mathcal{L}_{\text{task}}$ | Next-token cross-entropy of the adapted model. Labels default to the input ids; the loss applies the shift. |
+| $\mathrm{KL}$ | Forward KL from the base model $F_0$ to the adapted model $F_0 + R$, averaged over batch and positions. Penalises the adapter for moving away from the base distribution. Base logits are wrapped in `stop_gradient`. |
+| $\lVert\phi\rVert^2$ | Squared L2 norm of all adapter parameters. |
+
+`a1_objective` returns `(total, terms)`, where `terms` holds `total`, `task`, `kl` and `wd`. KL is always computed and logged, even when $\lambda_{\text{kl}} = 0$ (the default).
+
+---
+
+## Training Loop
+
+Implemented in [`experiments/run_stage_a1.py`](../experiments/run_stage_a1.py):
+
+1. Load the config and build `ResidualConfig`, `A1Config` and `TrainingConfig`.
+2. Load the frozen model into `FrozenSubstrate` and confirm its weights are frozen.
+3. Build the adapter and initialise its parameters.
+4. Tokenise WikiText-2 into contiguous `[n, seq_len]` blocks. Train batches are shuffled and seeded; eval batches are fixed, so the start and end evaluations are comparable.
+5. Evaluate at init: base and adapted loss, perplexity and KL.
+6. For each step, compute `a1_objective` and its gradient with respect to the adapter, then apply an `optax.adam` update.
+7. Evaluate again and confirm the base weights are unchanged. The script exits with a non-zero code if they are not.
 
 ```text
-ResidualConfig (adapter: section of a1_lora_baseline.yaml, via from_dict)
-     │
-     ▼
-ResidualAdapter(config, substrate.architecture)
-     │ resolve_late_layers(L, late_start, late_end) ─► validate_interception_layers
-     │ -> adapter.layers, e.g. (7, 8, 9, 10)
-     ▼
-init_params() -> {"layer_l": {"A": N(0, init_std²), "B": 0}}   (independent of θ0)
-     │
-     ▼
-substrate.run_with_interception(ids,
-        modify_fn=adapter.modify_fn(params), intercept_layers=adapter.layers)
-     │
-     ├── Blocks 0 … l-1 (frozen)
-     ▼
-Block l output h_l ──[hook]──► intermediates[l] = h_l (pristine)
-     │
-     ▼ apply(params, h_l, l)
-     ├── 1. params.get(layer_key(l)); no entry -> return h_l unchanged
-     ├── 2. residual: s · σ(h_l.astype(float32) @ A) @ B
-     └── 3. h̃_l = h_l + residual.astype(h_l.dtype)
-     │
-     ▼
-Blocks l+1 … L-1 (frozen, consume h̃_l) -> ln_f -> LM head -> logits
-     │
-     ▼
-loss (e.g. a1_objective) ─► jax.grad w.r.t. params only ─► optax.adam(params)
+input ids ──► FrozenSubstrate ──────────────────────────────► base logits (stop_gradient)
+          │                                                         │
+          └─► FrozenSubstrate + adapter hook on late blocks ──► adapted logits
+                                                                    │
+                                   task CE + λ_kl·KL + λ_wd·‖φ‖² ◄──┘
+                                                │
+                                   jax.grad w.r.t. adapter only ──► optax.adam
+```
+
+Each step runs two forward passes (base and adapted). The step is not JIT-compiled, so training on CPU is slow.
+
+---
+
+## Code Layout
+
+| File | Purpose |
+|---|---|
+| [`residual/adapter.py`](adapter.py) | `ResidualConfig`, `ResidualAdapter`, layer selection |
+| [`stages/stage_A/a1.py`](../stages/stage_A/a1.py) | `A1Config`, `a1_objective`, `base_logits` |
+| [`metrics/performance.py`](../metrics/performance.py) | `cross_entropy_loss`, differentiable `kl_to_base`, `perplexity` |
+| [`experiments/run_stage_a1.py`](../experiments/run_stage_a1.py) | Training and evaluation runner |
+| [`configs/stage_A/a1_lora_baseline.yaml`](../configs/stage_A/a1_lora_baseline.yaml) | Default run configuration |
+| [`tests/residual/test_adapter.py`](../tests/residual/test_adapter.py) | Adapter unit tests |
+| [`tests/stage_A/test_a1_training.py`](../tests/stage_A/test_a1_training.py) | End-to-end A1 tests |
+
+---
+
+## API
+
+### `residual`
+
+| Name | Description |
+|---|---|
+| `ResidualConfig` | Frozen, validated dataclass: `rank=16`, `activation="identity"`, `alpha=None`, `init_std=None`, `late_start=None`, `late_end=None`, `seed=0`. `from_dict()` rejects unknown keys; `.scale` returns $s$. |
+| `ResidualAdapter(config, architecture)` | Builds the adapter from the substrate's architecture. Attributes: `layers`, `hidden_size`, `scale`, `init_std`. |
+| `.init_params()` | Returns the initial `AdapterParams`. |
+| `.apply(params, h, layer_idx)` | Adds the residual; blocks without parameters pass through unchanged. |
+| `.residual(layer_params, h)` | Returns the raw residual in float32. |
+| `.modify_fn(params)` | Returns a `(hidden, layer_idx) -> hidden` hook for `FrozenSubstrate.run_with_interception`. |
+| `ResidualAdapter.num_params(params)` | Total trainable parameter count. |
+| `ResidualAdapter.l2_norm_sq(params)` | $\lVert\phi\rVert^2$ as a float32 scalar. |
+| `resolve_late_layers(num_layers, late_start=None, late_end=None)` | Returns the adapted block indices. |
+| `layer_key(layer_idx)` | Returns `f"layer_{layer_idx}"`. |
+| `AdapterParams` | Type alias: `dict[str, dict[str, jax.Array]]`. |
+| `ACTIVATIONS` | Read-only mapping of activation name to function. |
+
+### `stages.stage_A.a1`
+
+| Name | Description |
+|---|---|
+| `A1Config` | Frozen dataclass: `lambda_kl=0.0`, `lambda_wd=0.0` (both must be `>= 0`). `from_dict()` rejects unknown keys. |
+| `a1_objective(params, *, substrate, adapter, config, input_ids, labels=None, base=None)` | Returns `(total, terms)`. `base` accepts precomputed base logits. |
+| `base_logits(substrate, input_ids)` | Base-model logits with gradients stopped. |
+
+---
+
+## Configuration
+
+[`configs/stage_A/a1_lora_baseline.yaml`](../configs/stage_A/a1_lora_baseline.yaml) has three sections, each mapping one-to-one to a dataclass. Unknown sections or keys are rejected.
+
+```yaml
+adapter:                # → ResidualConfig
+  rank: 16
+  activation: identity  # identity | gelu | relu | tanh
+  alpha: null           # null → scale 1.0, else alpha / rank
+  init_std: null        # null → 1/sqrt(d)
+  late_start: null      # null → L//2 + 1
+  late_end: null        # null → L - 2
+  seed: 0
+
+objective:              # → A1Config
+  lambda_kl: 0.0
+  lambda_wd: 0.0
+
+training:               # → TrainingConfig
+  model: gpt2
+  dataset: Salesforce/wikitext
+  dataset_config: wikitext-2-raw-v1
+  seq_len: 128
+  batch_size: 8
+  steps: 200
+  learning_rate: 1.0e-3
+  eval_batches: 8
+  log_every: 10
+  seed: 0
 ```
 
 ---
 
-## File Breakdown
+## Installation
 
-### Adapter (`residual/`)
-
-- **`__init__.py`**: Re-exports the public API: `ResidualConfig`, `resolve_late_layers`, `ResidualAdapter`, `layer_key`, `AdapterParams`, `ACTIVATIONS`.
-- **`adapter.py`**: The implementation.
-
-| Name | Signature / description |
-|---|---|
-| `ResidualConfig` | `ResidualConfig(rank: int = 16, activation: str = "identity", alpha: float \| None = None, init_std: float \| None = None, late_start: int \| None = None, late_end: int \| None = None, seed: int = 0)`. Frozen dataclass, validated on construction; `from_dict(data)` rejects unknown keys; `scale` is $s$. |
-| `resolve_late_layers` | `resolve_late_layers(num_layers: int, late_start: int \| None = None, late_end: int \| None = None) -> tuple[int, ...]` |
-| `ResidualAdapter` | `ResidualAdapter(config: ResidualConfig, architecture: Architecture)`; attributes `layers`, `hidden_size`, `scale`, `init_std`. |
-| `.init_params` | `init_params() -> AdapterParams` |
-| `.residual` | `residual(layer_params: Mapping[str, jax.Array], h: jax.Array) -> jax.Array`: float32, not cast back. |
-| `.apply` | `apply(params: AdapterParams, h: jax.Array, layer_idx: int) -> jax.Array` |
-| `.modify_fn` | `modify_fn(params: AdapterParams) -> Callable[[jax.Array, int], jax.Array]` |
-| `.num_params` | `num_params(params: AdapterParams) -> int` (static method) |
-| `.l2_norm_sq` | `l2_norm_sq(params: AdapterParams) -> jax.Array` (static method): $\lVert\phi\rVert^2$. |
-| `layer_key` | `layer_key(layer_idx: int) -> str`: `f"layer_{layer_idx}"`. |
-| `AdapterParams` | `dict[str, dict[str, jax.Array]]` |
-| `ACTIVATIONS` | Read-only mapping of activation name to function. |
-
-### Related Stage A1 code
-
-- **[`stages/stage_A/a1.py`](../stages/stage_A/a1.py)**: `A1Config` and `a1_objective` (task CE + KL to base + weight decay).
-- **[`metrics/performance.py`](../metrics/performance.py)**: `cross_entropy_loss`, differentiable `kl_to_base`, `perplexity`.
-- **[`experiments/run_stage_a1.py`](../experiments/run_stage_a1.py)**: training runner (`optax.adam` over the adapter PyTree only).
-- **[`configs/stage_A/a1_lora_baseline.yaml`](../configs/stage_A/a1_lora_baseline.yaml)**: `adapter:`, `objective:`, `training:` sections.
-
----
-
-## Test Suite Documentation
-
-| Test File | Focus Areas |
-|---|---|
-| `tests/residual/test_adapter.py` | Layer resolution for $L$ = 12, 24, 32, explicit bounds and every invalid-bound case; parameter shapes and keys; $B = 0$ and std of $A$ at init; `init_std` override and seeding; `num_params` $= 2dr\,|\text{layers}|$; `l2_norm_sq`; zero residual at init; untouched non-adapted layers; residual formula, rank-one atoms and float32 cast-back; config validation and unknown-key rejection. No substrate needed. |
-| `tests/stage_A/test_a1_training.py` | On the 12-block GPT-2 and Pythia fixtures: adapted logits equal base at init (`atol=1e-5`); pristine intermediates; $\partial L/\partial B \ne 0$ and $\partial L/\partial A = 0$ at init, $\partial L/\partial A \ne 0$ once $B \ne 0$; finite-difference check; no gradient on substrate params; objective terms; optimizer state holds only adapter leaves; after training, loss decreases, KL > 0, $B \ne 0$ and `params_unchanged()` is `True`; `A1Config` and shipped-YAML validation. |
-
----
-
-## Installation & Requirements
-
-The adapter has no dependencies beyond the project's (`jax`, plus `frozenllm` for `Architecture` and `validate_interception_layers`). Install the whole package from the repository root:
+From the repository root:
 
 ```bash
 python -m venv .venv
@@ -131,48 +210,33 @@ pip install -e ".[dev]"
 pre-commit install
 ```
 
-`torch>=2.6` has no wheels for Intel macOS; there, use the CPU image built from the repository `Dockerfile`:
+On Intel macOS, where `torch>=2.6` has no wheels, use the Docker image:
 
 ```bash
 docker build -t neuro-symbolic-llm .
 docker run --rm -it -v "$PWD":/app neuro-symbolic-llm
 ```
 
-The install is editable. After changing the package list in `pyproject.toml`, rerun `pip install -e ".[dev]"` (or rebuild the image) so that `residual` is importable outside the repository root.
-
 ---
 
-## How to Run
+## Usage
 
-### 1. Run the Stage A1 Runner
+### Train
 
-Trains the adapter on WikiText-2 over frozen GPT-2 (downloads the model and dataset on first run):
+The model and dataset are downloaded on the first run.
 
 ```bash
 python experiments/run_stage_a1.py --config configs/stage_A/a1_lora_baseline.yaml
 
-# Override the rank and number of steps (--model is also accepted)
+# Override rank, steps or model
 python experiments/run_stage_a1.py --config configs/stage_A/a1_lora_baseline.yaml --rank 8 --steps 20
 ```
 
-The runner logs the resolved layers, trainable/frozen parameter counts, loss terms, KL, perplexity and step time. It exits non-zero if `verify_frozen()` reports changed base parameters.
+The runner logs the adapted layers, trainable and frozen parameter counts, loss terms, perplexity, KL and step time.
 
-The step is not jitted, so CPU training is slow. With the shipped config (`batch_size: 8`, `seq_len: 128`), one step took about 3 minutes in a 3.8 GiB Docker VM, and the process was then killed, most likely out of memory. A copy of the config with `batch_size: 2` and `seq_len: 64` completed 20 steps in the same environment.
+> **Note:** On CPU or with limited memory, lower `batch_size` and `seq_len` (for example `2` and `64`), or use a GPU.
 
-### 2. Run Tests
-
-```bash
-# Adapter unit tests and Stage A1 integration tests
-pytest tests/residual/ tests/stage_A/ -v
-```
-
-### 3. Code Quality Checks
-
-```bash
-pre-commit run --all-files
-```
-
-### 4. Quickstart: Python Example
+### Python
 
 ```python
 import jax
@@ -181,41 +245,54 @@ from transformers import GPT2Config, GPT2LMHeadModel
 
 from frozenllm.substrate import FrozenSubstrate
 from residual import ResidualAdapter, ResidualConfig
+from stages.stage_A.a1 import A1Config, a1_objective
 
-# 1. Frozen substrate: tiny 12-block GPT-2 (the test fixture config).
-#    FrozenSubstrate("gpt2") loads the real checkpoint instead.
+# Tiny 12-block GPT-2. Use FrozenSubstrate("gpt2") for the real checkpoint.
 cfg = GPT2Config(n_layer=12, n_head=4, n_embd=32, n_positions=32, vocab_size=64,
                  bos_token_id=1, eos_token_id=2)
 substrate = FrozenSubstrate(GPT2LMHeadModel(cfg).eval(), config=cfg)
 
-# 2. Adapter on the late layers, zero residual at init
 adapter = ResidualAdapter(ResidualConfig(rank=4), substrate.architecture)
 params = adapter.init_params()
 print(adapter.layers)  # (7, 8, 9, 10)
-ids = jnp.arange(9, dtype=jnp.int32)[None, :]  # [batch, seq_len]
 
-# 3. Loss through the frozen substrate, as a function of the adapter only
-def loss_fn(params):
-    out = substrate.run_with_interception(
-        ids, modify_fn=adapter.modify_fn(params), intercept_layers=adapter.layers
-    )
-    return substrate.compute_loss(out.logits, ids)
+ids = jnp.arange(9, dtype=jnp.int32)[None, :]
 
-# 4. Gradients w.r.t. the adapter. At init dL/dB != 0 and dL/dA == 0 (B = 0).
-loss, grads = jax.value_and_grad(loss_fn)(params)
+(total, terms), grads = jax.value_and_grad(a1_objective, has_aux=True)(
+    params,
+    substrate=substrate,
+    adapter=adapter,
+    config=A1Config(lambda_kl=0.1),
+    input_ids=ids,
+)
 
-# 5. Base parameters are untouched
 assert substrate.params_unchanged()
 ```
 
 ---
 
-## Core Architectural Guarantees
+## Testing
 
-1. **Frozen Base ($\nabla \theta_0 = 0$):** The adapter holds no reference to `substrate.params`. They receive no gradient, the optimizer state contains only adapter leaves, and `params_unchanged()` is `True` after training (`test_substrate_params_receive_no_gradient`, `test_optimizer_state_holds_only_adapter_leaves`, `test_training_moves_only_the_adapter`).
-2. **Pristine Intermediates:** `ForwardResult.hidden_state(l)` is $h_l$ before the residual (`test_intermediates_are_pristine`).
-3. **Zero-Residual Start:** At init the adapted logits equal the base logits (`atol=1e-5`) and blocks outside `adapter.layers` are untouched (`test_initial_logits_equal_base`, `test_zero_residual_at_init`, `test_non_adapted_layers_untouched`).
-4. **No Silent Layer Changes:** Invalid depths or bounds raise `ValueError`; they are never clamped or skipped (`test_invalid_bounds_raise`, `test_too_shallow_model_raises`).
-5. **Strict Configuration:** `ResidualConfig.from_dict` rejects unknown keys, so the YAML `adapter:` section must mirror the dataclass (`test_config_rejects_unknown_keys`, `test_shipped_yaml_loads_and_rejects_unknown_keys`).
+```bash
+pytest tests/residual/ tests/stage_A/ -v
+pre-commit run --all-files
+```
 
-Out of scope for this package: predictive coding (Stages A2/A3), FabricPC, symbolic heads (Stage A4) and weight-level LoRA. Design rationale: [`stages/stage_A/architecture.md`](../stages/stage_A/architecture.md) and research plan `pc_residual_research_plan_v8` §7.2–7.3 (not stored in this repository).
+| Suite | Covers |
+|---|---|
+| `tests/residual/test_adapter.py` | Layer resolution and bound validation, parameter shapes and initialisation, seeding, parameter count, residual math, float32 cast-back, config validation. Runs without a model. |
+| `tests/stage_A/test_a1_training.py` | On 12-block GPT-2 and Pythia fixtures: logits equal the base at init, unmodified intermediates, gradients reach the adapter only, finite-difference check, objective terms, and a short training run that leaves the base unchanged. |
+
+---
+
+## Guarantees
+
+Each guarantee is enforced by tests.
+
+| Guarantee | Test(s) |
+|---|---|
+| **Frozen base:** base weights get no gradient, are absent from the optimizer state, and are unchanged after training. | `test_substrate_params_receive_no_gradient`, `test_optimizer_state_holds_only_adapter_leaves`, `test_training_moves_only_the_adapter` |
+| **Unmodified intermediates:** `ForwardResult.hidden_state(l)` returns $h_l$ before the residual is added. | `test_intermediates_are_pristine` |
+| **Zero-residual start:** adapted logits equal base logits at init (`atol=1e-5`); non-adapted blocks are untouched. | `test_initial_logits_equal_base`, `test_zero_residual_at_init`, `test_non_adapted_layers_untouched` |
+| **No silent layer changes:** invalid depths or bounds raise `ValueError`. | `test_invalid_bounds_raise`, `test_too_shallow_model_raises` |
+| **Strict configuration:** unknown config keys are rejected. | `test_config_rejects_unknown_keys`, `test_shipped_yaml_loads_and_rejects_unknown_keys` |

@@ -1,4 +1,4 @@
-"""Hidden-state residual adapter (research plan §7.2).
+"""Hidden-state residual adapter .
 
 At each adapted block ``l`` the frozen block output ``h`` (row vectors of
 size ``d``) is replaced by
@@ -140,6 +140,7 @@ class ResidualAdapter:
             architecture.num_layers,
         )
         self.scale = config.scale
+        # 1/sqrt(d) keeps each component of h @ A at roughly the per-feature scale of h.
         self.init_std = (
             config.init_std
             if config.init_std is not None
@@ -151,6 +152,10 @@ class ResidualAdapter:
         """``A ~ N(0, init_std^2)`` and ``B = 0`` per layer, deterministic from seed."""
         base = jax.random.PRNGKey(self.config.seed)
         d, r = self.hidden_size, self.config.rank
+        # Keys are folded by block index, not position in self.layers, so a
+        # block's A does not change when late_start / late_end move.
+        # B = 0 makes the residual exactly zero while dL/dB = sigma(hA)^T dL/dh
+        # stays nonzero; A starts receiving gradient once B moves.
         return {
             layer_key(idx): {
                 "A": self.init_std
@@ -166,6 +171,8 @@ class ResidualAdapter:
         self, layer_params: Mapping[str, jax.Array], h: jax.Array
     ) -> jax.Array:
         """``s * sigma(h @ A) @ B`` in float32 (not yet cast back)."""
+        # Upcast so the rank-r bottleneck does not lose precision on bf16/fp16
+        # substrates. Shapes: [..., d] @ [d, r] -> [..., r] @ [r, d] -> [..., d].
         h32 = h.astype(jnp.float32)
         return self.scale * (
             self._activation(h32 @ layer_params["A"]) @ layer_params["B"]
@@ -176,11 +183,14 @@ class ResidualAdapter:
         layer_params = params.get(layer_key(layer_idx))
         if layer_params is None:
             return h
+        # Cast back so downstream frozen blocks see their native dtype.
         return h + self.residual(layer_params, h).astype(h.dtype)
 
     def modify_fn(self, params: AdapterParams) -> Callable[[jax.Array, int], jax.Array]:
         """A substrate ``ModifyFn`` ``(hidden, layer_idx) -> hidden`` over ``params``."""
 
+        # Closing over params (possibly tracers) is what lets jax.grad reach the
+        # adapter through the substrate's forward hooks.
         def modify(hidden: jax.Array, layer_idx: int) -> jax.Array:
             return self.apply(params, hidden, layer_idx)
 
@@ -194,6 +204,7 @@ class ResidualAdapter:
     @staticmethod
     def l2_norm_sq(params: AdapterParams) -> jax.Array:
         """``||phi||^2`` over all adapter parameters."""
+        # Array-valued start so an empty PyTree still yields a float32 scalar.
         return sum(
             (jnp.sum(jnp.square(leaf)) for leaf in jax.tree_util.tree_leaves(params)),
             start=jnp.zeros((), dtype=jnp.float32),

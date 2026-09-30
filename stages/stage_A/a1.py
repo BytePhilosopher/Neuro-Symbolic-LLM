@@ -1,9 +1,10 @@
-"""Stage A1: ordinary residual baseline (research plan §7.3).
+"""Stage A1: ordinary residual baseline.
 
     L_A1 = L_task + lambda_kl * KL(p_F0 || p_F0+R) + lambda_wd * ||phi||^2
 
 No predictive coding and no symbolic head. Only the adapter parameters
-``phi`` are differentiated; the substrate is closed over, not traced.
+``phi`` (the first positional argument) are differentiated; the substrate is
+passed by keyword and never receives gradients.
 """
 
 from __future__ import annotations
@@ -46,6 +47,7 @@ class A1Config:
 
 def base_logits(substrate: FrozenSubstrate, input_ids: jax.Array) -> jax.Array:
     """Logits of the unmodified base model ``F0``, with gradients stopped."""
+    # Empty intercept_layers: no hooks are attached, so this is the plain base forward.
     result = substrate.run_with_interception(
         input_ids, modify_fn=identity_modify, intercept_layers=()
     )
@@ -79,6 +81,8 @@ def a1_objective(
         else jax.lax.stop_gradient(base)
     )
     task = cross_entropy_loss(adapted, input_ids if labels is None else labels)
+    # Forward KL with the base as the target: penalises the adapter for dropping
+    # probability mass the base assigns, keeping it near F0.
     kl = kl_to_base(base, adapted)
     wd = ResidualAdapter.l2_norm_sq(params)
     total = task + config.lambda_kl * kl + config.lambda_wd * wd

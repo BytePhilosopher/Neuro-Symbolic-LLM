@@ -1,4 +1,4 @@
-"""Task-performance and drift metrics (research plan §13-14).
+"""Task-performance and drift metrics.
 
 All functions return ``jax.Array`` values so they can be used inside a
 differentiated loss as well as for logging.
@@ -23,6 +23,8 @@ def kl_to_base(base_logits: jax.Array, adapted_logits: jax.Array) -> jax.Array:
     Same quantity as ``frozenllm.substrate.compute_kl_drift``, but returned as
     an unclamped ``jax.Array`` so gradients flow into ``adapted_logits``.
     """
+    # float32 log-space for stability over large vocabularies. Sum over V gives a
+    # per-position KL [B, T]; the mean runs over batch and positions.
     log_p = jax.nn.log_softmax(base_logits.astype(jnp.float32), axis=-1)
     log_q = jax.nn.log_softmax(adapted_logits.astype(jnp.float32), axis=-1)
     return jnp.mean(jnp.sum(jnp.exp(log_p) * (log_p - log_q), axis=-1))

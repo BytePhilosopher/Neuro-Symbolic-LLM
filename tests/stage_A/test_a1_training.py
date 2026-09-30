@@ -1,7 +1,7 @@
 """Stage A1 integration tests on the 12-layer GPT-2 and Pythia fixtures.
 
 These run the residual adapter through the real ``FrozenSubstrate`` and check
-the invariants of ``stages/stage_A/architecture.md`` §5: identity at init,
+the guarantees in ``stages/stage_A/architecture.md``: identity at init,
 pristine intermediates, the JAX gradient path into the adapter, optimizer
 isolation, and that training moves only the adapter.
 """
@@ -48,6 +48,7 @@ def input_ids() -> jax.Array:
 
 
 def _with_random_b(params: AdapterParams, scale: float = 0.05) -> AdapterParams:
+    # Nonzero B makes the residual active and gives A a nonzero gradient.
     rng = np.random.default_rng(1)
     return {
         k: {
@@ -112,6 +113,7 @@ def test_intermediates_are_pristine(
     base = substrate.run_with_interception(input_ids, intercept_layers=adapter.layers)
 
     assert result.layer_indices() == adapter.layers
+    # The cache must hold the pre-modification input to modify_fn, not its output.
     for idx in adapter.layers:
         h_in, h_out = seen[idx]
         np.testing.assert_array_equal(
@@ -127,7 +129,7 @@ def test_intermediates_are_pristine(
     )
 
 
-# ── gradient path (architecture.md §4) ───────────────────────────────────────
+# ── gradient path (architecture.md, "Gradient Path") ─────────────────────────
 
 
 def test_grad_b_nonzero_and_grad_a_zero_at_init(
@@ -165,6 +167,7 @@ def test_grad_a_matches_finite_difference(
     # Probe the entry with the largest gradient so the float32 loss difference
     # is well above round-off.
     i, j = np.unravel_index(int(jnp.argmax(jnp.abs(g_a))), g_a.shape)
+    # Large step for float32; the central difference keeps truncation error O(eps^2).
     eps = 0.1
 
     def shifted(delta: float) -> float:
