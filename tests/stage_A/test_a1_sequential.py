@@ -118,7 +118,9 @@ def test_run_sequential_writes_matrix_and_artifacts(
 
 
 def test_config_round_trips_through_writer(runner: Any, tmp_path: Path) -> None:
-    cfg = runner.load_configs(REPO_ROOT / "configs" / "stage_A" / "a1_lora_baseline.yaml")
+    cfg = runner.load_configs(
+        REPO_ROOT / "configs" / "stage_A" / "a1_lora_baseline.yaml"
+    )
     assert [d.name for d in cfg.domains] == ["wikitext2", "ag_news", "imdb"]
     with RunWriter(tmp_path, "run") as writer:
         path = writer.write_config(cfg.to_dict())
@@ -126,7 +128,9 @@ def test_config_round_trips_through_writer(runner: Any, tmp_path: Path) -> None:
 
 
 def test_steps_override_applies_to_every_domain(runner: Any) -> None:
-    cfg = runner.load_configs(REPO_ROOT / "configs" / "stage_A" / "a1_lora_baseline.yaml")
+    cfg = runner.load_configs(
+        REPO_ROOT / "configs" / "stage_A" / "a1_lora_baseline.yaml"
+    )
     args = runner.parse_args(["--steps", "2", "--rank", "4"])
     out = runner.apply_overrides(cfg, args)
     assert out.training.steps == 2

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from typing import Any
 
 import jax.numpy as jnp
 import numpy as np
@@ -88,7 +89,7 @@ def test_non_matrix_raises() -> None:
 
 
 def test_training_step_time_returns_output_and_duration() -> None:
-    def step(x: float, *, scale: float) -> dict[str, object]:
+    def step(x: float, *, scale: float) -> dict[str, Any]:
         time.sleep(0.01)
         return {"y": jnp.asarray(x) * scale}
 
