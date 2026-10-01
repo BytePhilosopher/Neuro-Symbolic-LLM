@@ -21,7 +21,7 @@ from stages.results import RunWriter, load_params
 from stages.stage_A.a1 import A1Config
 from tests.frozenllm.conftest import BATCH, NUM_TOKENS, SEQ, make_substrate
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 @pytest.fixture(scope="module")

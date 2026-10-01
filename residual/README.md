@@ -139,9 +139,9 @@ Each step runs two forward passes (base and adapted). The step is not JIT-compil
 | [`experiments/run_stage_a1.py`](../experiments/run_stage_a1.py) | Multi-domain sequential training and evaluation runner |
 | [`configs/stage_A/a1_lora_baseline.yaml`](../configs/stage_A/a1_lora_baseline.yaml) | Run configuration: WikiText-2 → AG News → IMDB |
 | [`tests/residual/test_adapter.py`](../tests/residual/test_adapter.py) | Adapter unit tests |
-| [`tests/stage_A/test_a1_training.py`](../tests/stage_A/test_a1_training.py) | End-to-end A1 tests |
-| [`tests/stage_A/test_a1_sequential.py`](../tests/stage_A/test_a1_sequential.py) | Sequential runner and domain config tests |
-| [`tests/metrics/`](../tests/metrics/), [`tests/stages/`](../tests/stages/) | Metric and run-writer unit tests |
+| [`tests/residual/stage_A/test_a1_training.py`](../tests/residual/stage_A/test_a1_training.py) | End-to-end A1 tests |
+| [`tests/residual/stage_A/test_a1_sequential.py`](../tests/residual/stage_A/test_a1_sequential.py) | Sequential runner and domain config tests |
+| [`tests/residual/metrics/`](../tests/residual/metrics/), [`tests/residual/test_results.py`](../tests/residual/test_results.py) | Metric and run-writer unit tests |
 
 ---
 
@@ -310,17 +310,17 @@ assert substrate.params_unchanged()
 ## Testing
 
 ```bash
-pytest tests/residual/ tests/stage_A/ tests/stages/ tests/metrics/ -v
+pytest tests/residual/ -v
 pre-commit run --all-files
 ```
 
 | Suite | Covers |
 |---|---|
 | `tests/residual/test_adapter.py` | Layer resolution and bound validation, parameter shapes and initialisation, seeding, parameter count, residual math, float32 cast-back, config validation. Runs without a model. |
-| `tests/stage_A/test_a1_training.py` | On 12-block GPT-2 and Pythia fixtures: logits equal the base at init, unmodified intermediates, gradients reach the adapter only, finite-difference check, objective terms, and a short training run that leaves the base unchanged. |
-| `tests/stage_A/test_a1_sequential.py` | Two-domain run on the GPT-2 fixture with synthetic data: loss matrix and summaries, event order in `metrics.jsonl`, saved checkpoints, config round-trip, `--steps` override, domain config validation. |
-| `tests/metrics/` | `mean_seen_accuracy`, `mean_forgetting` (accuracy and loss), `training_step_time`, `residual_compressibility`, `compressibility_curve`. Runs without a model. |
-| `tests/stages/test_results.py` | `RunWriter` artifacts, atomic writes, refusal to overwrite, checkpoint round-trip. Runs without a model. |
+| `tests/residual/stage_A/test_a1_training.py` | On 12-block GPT-2 and Pythia fixtures: logits equal the base at init, unmodified intermediates, gradients reach the adapter only, finite-difference check, objective terms, and a short training run that leaves the base unchanged. |
+| `tests/residual/stage_A/test_a1_sequential.py` | Two-domain run on the GPT-2 fixture with synthetic data: loss matrix and summaries, event order in `metrics.jsonl`, saved checkpoints, config round-trip, `--steps` override, domain config validation. |
+| `tests/residual/metrics/` | `mean_seen_accuracy`, `mean_forgetting` (accuracy and loss), `training_step_time`, `residual_compressibility`, `compressibility_curve`. Runs without a model. |
+| `tests/residual/test_results.py` | `RunWriter` artifacts, atomic writes, refusal to overwrite, checkpoint round-trip. Runs without a model. |
 
 ---
 

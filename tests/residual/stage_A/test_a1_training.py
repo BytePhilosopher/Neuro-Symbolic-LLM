@@ -27,7 +27,7 @@ from stages.stage_A.a1 import A1Config, a1_objective, base_logits
 from tests.frozenllm.conftest import BATCH, NUM_TOKENS, SEQ, make_substrate
 
 FAMILIES = ("gpt2", "neox")
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 @pytest.fixture(scope="module", params=FAMILIES)
