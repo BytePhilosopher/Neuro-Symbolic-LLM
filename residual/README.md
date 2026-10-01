@@ -101,13 +101,17 @@ $$\mathcal{L}_{A1} = \mathcal{L}_{\text{task}} + \lambda_{\text{kl}} \cdot \math
 
 Implemented in [`experiments/run_stage_a1.py`](../experiments/run_stage_a1.py):
 
-1. Load the config and build `ResidualConfig`, `A1Config` and `TrainingConfig`.
+1. Load the config into a `RunConfig`: `ResidualConfig`, `A1Config`, `TrainingConfig` and one `DomainConfig` per domain.
 2. Load the frozen model into `FrozenSubstrate` and confirm its weights are frozen.
 3. Build the adapter and initialise its parameters.
-4. Tokenise WikiText-2 into contiguous `[n, seq_len]` blocks. Train batches are shuffled and seeded; eval batches are fixed, so the start and end evaluations are comparable.
-5. Evaluate at init: base and adapted loss, perplexity and KL.
-6. For each step, compute `a1_objective` and its gradient with respect to the adapter, then apply an `optax.adam` update.
-7. Evaluate again and confirm the base weights are unchanged. The script exits with a non-zero code if they are not.
+4. Tokenise each domain's train and eval splits into contiguous `[n, seq_len]` blocks. Train batches are shuffled and seeded per task; eval batches are fixed, so every evaluation sees the same data.
+5. Create the run directory and write `config.yaml` and `meta.json` (see [Run Artifacts](#run-artifacts)).
+6. Evaluate every domain at init: base and adapted loss, perplexity and KL.
+7. Train on the domains in order. Each step computes `a1_objective` and its gradient with respect to the adapter, then applies an `optax.adam` update. Adam's moments are reset at each domain boundary unless `reset_optimizer: false`.
+8. After each task, save the adapter and evaluate every domain. This fills the loss matrix `L[t][j]` (domain `j` after task `t`).
+9. Write `results.json` and confirm the base weights are unchanged. The script exits with a non-zero code if they are not.
+
+A single-domain config is a sequence of length one, which is a plain A1 run.
 
 ```text
 input ids ──► FrozenSubstrate ──────────────────────────────► base logits (stop_gradient)
@@ -129,11 +133,15 @@ Each step runs two forward passes (base and adapted). The step is not JIT-compil
 |---|---|
 | [`residual/adapter.py`](adapter.py) | `ResidualConfig`, `ResidualAdapter`, layer selection |
 | [`stages/stage_A/a1.py`](../stages/stage_A/a1.py) | `A1Config`, `a1_objective`, `base_logits` |
-| [`metrics/performance.py`](../metrics/performance.py) | `cross_entropy_loss`, differentiable `kl_to_base`, `perplexity` |
-| [`experiments/run_stage_a1.py`](../experiments/run_stage_a1.py) | Training and evaluation runner |
-| [`configs/stage_A/a1_lora_baseline.yaml`](../configs/stage_A/a1_lora_baseline.yaml) | Default run configuration |
+| [`metrics/performance.py`](../metrics/performance.py) | `cross_entropy_loss`, differentiable `kl_to_base`, `perplexity`, `mean_seen_accuracy`, `mean_forgetting`, `training_step_time` |
+| [`metrics/representation.py`](../metrics/representation.py) | `loss_improvement`, `residual_compressibility`, `compressibility_curve` |
+| [`stages/results.py`](../stages/results.py) | `RunWriter`: run directory, JSONL metrics, atomic JSON, adapter checkpoints |
+| [`experiments/run_stage_a1.py`](../experiments/run_stage_a1.py) | Multi-domain sequential training and evaluation runner |
+| [`configs/stage_A/a1_lora_baseline.yaml`](../configs/stage_A/a1_lora_baseline.yaml) | Run configuration: WikiText-2 → AG News → IMDB |
 | [`tests/residual/test_adapter.py`](../tests/residual/test_adapter.py) | Adapter unit tests |
 | [`tests/stage_A/test_a1_training.py`](../tests/stage_A/test_a1_training.py) | End-to-end A1 tests |
+| [`tests/stage_A/test_a1_sequential.py`](../tests/stage_A/test_a1_sequential.py) | Sequential runner and domain config tests |
+| [`tests/metrics/`](../tests/metrics/), [`tests/stages/`](../tests/stages/) | Metric and run-writer unit tests |
 
 ---
 
@@ -168,7 +176,7 @@ Each step runs two forward passes (base and adapted). The step is not JIT-compil
 
 ## Configuration
 
-[`configs/stage_A/a1_lora_baseline.yaml`](../configs/stage_A/a1_lora_baseline.yaml) has three sections, each mapping one-to-one to a dataclass. Unknown sections or keys are rejected.
+[`configs/stage_A/a1_lora_baseline.yaml`](../configs/stage_A/a1_lora_baseline.yaml) has four sections, each mapping one-to-one to a dataclass. Unknown sections or keys are rejected.
 
 ```yaml
 adapter:                # → ResidualConfig
@@ -186,16 +194,28 @@ objective:              # → A1Config
 
 training:               # → TrainingConfig
   model: gpt2
-  dataset: Salesforce/wikitext
-  dataset_config: wikitext-2-raw-v1
   seq_len: 128
   batch_size: 8
-  steps: 200
+  steps: 200            # per domain, unless the domain sets its own
   learning_rate: 1.0e-3
   eval_batches: 8
   log_every: 10
   seed: 0
+  reset_optimizer: true # fresh Adam moments at each domain boundary
+  output_dir: runs
+
+domains:                # → DomainConfig each; trained in order, names unique
+  - name: wikitext2     # [A-Za-z0-9_.-]+, used in checkpoint file names
+    dataset: Salesforce/wikitext
+    dataset_config: wikitext-2-raw-v1
+    text_field: text
+    train_split: train  # HF slicing works: "train[:20000]"
+    eval_split: validation
+    separator: ""       # joins rows into one stream; "\n\n" for one-doc-per-row sets
+    steps: null         # null → training.steps
 ```
+
+`domains` is required and must be non-empty.
 
 ---
 
@@ -226,13 +246,29 @@ docker run --rm -it -v "$PWD":/app neuro-symbolic-llm
 The model and dataset are downloaded on the first run.
 
 ```bash
+# Sequential: WikiText-2 → AG News → IMDB
 python experiments/run_stage_a1.py --config configs/stage_A/a1_lora_baseline.yaml
 
-# Override rank, steps or model
-python experiments/run_stage_a1.py --config configs/stage_A/a1_lora_baseline.yaml --rank 8 --steps 20
+# Override rank, model, steps (applied to every domain) or where the run is written
+python experiments/run_stage_a1.py --config configs/stage_A/a1_lora_baseline.yaml \
+    --rank 8 --steps 20 --output-dir runs --run-name smoke
 ```
 
-The runner logs the adapted layers, trainable and frozen parameter counts, loss terms, perplexity, KL and step time.
+The runner logs the adapted layers, trainable and frozen parameter counts, loss terms, perplexity, KL and step time, and writes everything to the run directory.
+
+### Run Artifacts
+
+Each run writes a fresh directory, `<output_dir>/<run_name>/` (default name `a1-<UTC timestamp>`). An existing directory is never overwritten.
+
+| File | Contents |
+|---|---|
+| `config.yaml` | The resolved config after CLI overrides. It can be passed back with `--config`. |
+| `meta.json` | Git commit and dirty flag, library versions, argv, start time, model, adapted layers, parameter counts |
+| `metrics.jsonl` | One event per line. `train`: `task`, `domain`, `step`, `global_step`, `tokens`, `step_time`, `ppl`, `loss_total`, `loss_task`, `loss_kl`, `loss_wd`. `eval`: `after_task` (`-1` = init), `domain`, `base_loss`, `loss`, `ppl`, `kl`. |
+| `results.json` | `domains`, `base_loss[j]`, matrices `loss`, `ppl`, `kl` and `improvement` indexed `[t][j]`, `mean_seen_loss[t]`, `mean_forgetting[t]` (`null` at `t = 0`), `steps`, `tokens`, `mean_step_time`, `params_unchanged` |
+| `params/task_<t>_<name>.npz` | Adapter parameters after task `t`; read with `stages.results.load_params` |
+
+Forgetting is computed on loss, so a positive value means an earlier domain's loss rose above its best value since that domain was trained.
 
 > **Note:** On CPU or with limited memory, lower `batch_size` and `seq_len` (for example `2` and `64`), or use a GPU.
 
@@ -274,7 +310,7 @@ assert substrate.params_unchanged()
 ## Testing
 
 ```bash
-pytest tests/residual/ tests/stage_A/ -v
+pytest tests/residual/ tests/stage_A/ tests/stages/ tests/metrics/ -v
 pre-commit run --all-files
 ```
 
@@ -282,6 +318,9 @@ pre-commit run --all-files
 |---|---|
 | `tests/residual/test_adapter.py` | Layer resolution and bound validation, parameter shapes and initialisation, seeding, parameter count, residual math, float32 cast-back, config validation. Runs without a model. |
 | `tests/stage_A/test_a1_training.py` | On 12-block GPT-2 and Pythia fixtures: logits equal the base at init, unmodified intermediates, gradients reach the adapter only, finite-difference check, objective terms, and a short training run that leaves the base unchanged. |
+| `tests/stage_A/test_a1_sequential.py` | Two-domain run on the GPT-2 fixture with synthetic data: loss matrix and summaries, event order in `metrics.jsonl`, saved checkpoints, config round-trip, `--steps` override, domain config validation. |
+| `tests/metrics/` | `mean_seen_accuracy`, `mean_forgetting` (accuracy and loss), `training_step_time`, `residual_compressibility`, `compressibility_curve`. Runs without a model. |
+| `tests/stages/test_results.py` | `RunWriter` artifacts, atomic writes, refusal to overwrite, checkpoint round-trip. Runs without a model. |
 
 ---
 

@@ -325,15 +325,15 @@ def test_shipped_yaml_loads_and_rejects_unknown_keys(
 ) -> None:
     load_configs = _load_runner(monkeypatch).load_configs
 
-    adapter_cfg, objective_cfg, train_cfg = load_configs(
-        REPO_ROOT / "configs" / "stage_A" / "a1_lora_baseline.yaml"
-    )
-    assert adapter_cfg == ResidualConfig()
-    assert objective_cfg == A1Config()
-    assert train_cfg.model == "gpt2"
+    cfg = load_configs(REPO_ROOT / "configs" / "stage_A" / "a1_lora_baseline.yaml")
+    assert cfg.adapter == ResidualConfig()
+    assert cfg.objective == A1Config()
+    assert cfg.training.model == "gpt2"
+    assert [d.name for d in cfg.domains] == ["wikitext2", "ag_news", "imdb"]
 
+    domains = "domains:\n  - {name: d, dataset: x}\n"
     bad_key = tmp_path / "bad_key.yaml"
-    bad_key.write_text("adapter:\n  rank: 4\n  layers: [7, 8]\n")
+    bad_key.write_text("adapter:\n  rank: 4\n  layers: [7, 8]\n" + domains)
     with pytest.raises(ValueError, match="Unknown ResidualConfig keys"):
         load_configs(bad_key)
     bad_section = tmp_path / "bad_section.yaml"

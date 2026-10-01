@@ -1,5 +1,5 @@
-# Hidden-state residual adapter (not weight-level LoRA). See architecture.md.
-# Keys mirror ResidualConfig / A1Config / TrainingConfig; unknown keys are rejected.
+# Hidden-state residual adapter (not weight-level LoRA). See residual/README.md.
+# Keys mirror ResidualConfig / A1Config / TrainingConfig / DomainConfig; unknown keys are rejected.
 adapter:
   rank: 16
   activation: identity  # identity | gelu | relu | tanh
@@ -13,12 +13,36 @@ objective:
   lambda_wd: 0.0
 training:
   model: gpt2
-  dataset: Salesforce/wikitext
-  dataset_config: wikitext-2-raw-v1
   seq_len: 128
   batch_size: 8
-  steps: 200
+  steps: 200            # per domain, unless the domain sets its own
   learning_rate: 1.0e-3
   eval_batches: 8
   log_every: 10
   seed: 0
+  reset_optimizer: true
+  output_dir: runs
+# Trained in order, with every domain evaluated after every task: the loss
+# matrix, mean seen-task loss and mean forgetting that later stages are
+# compared against. Keep only the first domain for a plain single-domain run.
+domains:
+  # Encyclopedic prose; rows are lines that already end in "\n".
+  - name: wikitext2
+    dataset: Salesforce/wikitext
+    dataset_config: wikitext-2-raw-v1
+    train_split: train
+    eval_split: validation
+  # News; one article per row.
+  - name: ag_news
+    dataset: fancyzhx/ag_news
+    train_split: "train[:20000]"
+    eval_split: "test[:2000]"
+    separator: "\n\n"
+  # Movie reviews. The labelled splits are sorted by label, so train on the
+  # unlabelled split and evaluate on both ends of test.
+  - name: imdb
+    dataset: stanfordnlp/imdb
+    dataset_config: plain_text
+    train_split: "unsupervised[:10000]"
+    eval_split: "test[:1000]+test[-1000:]"
+    separator: "\n\n"
