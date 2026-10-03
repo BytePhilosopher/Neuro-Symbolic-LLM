@@ -49,10 +49,18 @@ def test_default_late_layers(num_layers: int, expected: tuple[int, ...]) -> None
 
 
 def test_shallowest_valid_model_gives_single_layer() -> None:
-    # L=4 passes the depth check but (2, 2] is empty, so bounds validation fails.
-    with pytest.raises(ValueError, match="2 < late_start <= late_end <= 2"):
-        resolve_late_layers(4)
+    # L=5: (2, 3] holds exactly one block.
     assert resolve_late_layers(5) == (3,)
+    assert ResidualAdapter(ResidualConfig(rank=2), _arch(5)).layers == (3,)
+
+
+def test_four_layer_model_is_rejected_by_depth_check() -> None:
+    # L=4 would give the empty range (2, 2], so it fails the depth check up
+    # front instead of with a bounds error that no late_start/late_end can fix.
+    with pytest.raises(ValueError, match="needs a model with >= 5 blocks"):
+        resolve_late_layers(4)
+    with pytest.raises(ValueError, match="model has 4"):
+        ResidualAdapter(ResidualConfig(rank=2), _arch(4))
 
 
 @pytest.mark.parametrize(
@@ -94,7 +102,7 @@ def test_invalid_bounds_raise(
     assert f"{num_layers // 2} < late_start <= late_end <= {num_layers - 2}" in msg
 
 
-@pytest.mark.parametrize("num_layers", [1, 2, 3])
+@pytest.mark.parametrize("num_layers", [1, 2, 3, 4])
 def test_too_shallow_model_raises(num_layers: int) -> None:
     with pytest.raises(ValueError, match=f"model has {num_layers}"):
         resolve_late_layers(num_layers)
@@ -232,6 +240,42 @@ def test_identity_is_sum_of_rank_one_atoms() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("activation", "alpha"), [("identity", None), ("gelu", 8.0), ("tanh", 2.0)]
+)
+def test_residual_is_decode_of_encode(activation: str, alpha: float | None) -> None:
+    d, r = 32, 4
+    adapter = ResidualAdapter(
+        ResidualConfig(rank=r, activation=activation, alpha=alpha), _arch(12, d)
+    )
+    rng = np.random.default_rng(2)
+    layer_params = {
+        "A": jnp.asarray(rng.normal(size=(d, r)), dtype=jnp.float32),
+        "B": jnp.asarray(rng.normal(size=(r, d)), dtype=jnp.float32),
+    }
+    h = _hidden(d, jnp.bfloat16)
+    z = adapter.encode(layer_params, h)
+    assert z.shape == (2, 5, r)
+    assert z.dtype == jnp.float32
+    np.testing.assert_array_equal(
+        adapter.residual(layer_params, h), adapter.decode(layer_params, z)
+    )
+
+
+@pytest.mark.parametrize("activation", sorted(ACTIVATIONS))
+def test_decode_is_zero_and_apply_is_identity_at_init(activation: str) -> None:
+    # B = 0 at init: decode(encode(h)) is exactly zero, so the adapted hidden
+    # state equals the base hidden state.
+    adapter = ResidualAdapter(ResidualConfig(rank=4, activation=activation), _arch(12))
+    params = adapter.init_params()
+    h = _hidden(32)
+    for idx in adapter.layers:
+        layer_params = params[layer_key(idx)]
+        z = adapter.encode(layer_params, h)
+        np.testing.assert_array_equal(adapter.decode(layer_params, z), 0.0)
+        np.testing.assert_array_equal(adapter.apply(params, h, idx), h)
+
+
 def test_residual_cast_back_to_hidden_dtype() -> None:
     adapter = ResidualAdapter(ResidualConfig(rank=4), _arch(12))
     params = jax.tree_util.tree_map(jnp.ones_like, adapter.init_params())
@@ -270,5 +314,78 @@ def test_config_from_dict() -> None:
 
 
 def test_config_rejects_unknown_keys() -> None:
-    with pytest.raises(ValueError, match="Unknown ResidualConfig keys: \\['layers'\\]"):
-        ResidualConfig.from_dict({"rank": 8, "layers": [6, 10]})
+    with pytest.raises(
+        ValueError, match="Unknown ResidualConfig keys: \\['dropout'\\]"
+    ):
+        ResidualConfig.from_dict({"rank": 8, "dropout": 0.1})
+
+
+# ── explicit layers ──────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("layers", "expected"),
+    [
+        ([6, 10], (6, 10)),
+        ([0], (0,)),  # early blocks are allowed: no late-range restriction
+        ([11], (11,)),  # so is the final block
+        ([9, 2, 5], (2, 5, 9)),  # sorted by the substrate check
+    ],
+)
+def test_explicit_layers_override_late_range(
+    layers: list[int], expected: tuple[int, ...]
+) -> None:
+    adapter = ResidualAdapter(ResidualConfig(rank=2, layers=layers), _arch(12))
+    assert adapter.layers == expected
+    assert set(adapter.init_params()) == {layer_key(i) for i in expected}
+
+
+def test_explicit_layers_work_below_min_num_layers() -> None:
+    # The depth rule belongs to the late range; explicit layers only need to exist.
+    assert ResidualAdapter(ResidualConfig(rank=2, layers=[1]), _arch(2)).layers == (1,)
+
+
+def test_explicit_layers_keep_per_block_init() -> None:
+    # A is folded by block index, so block 8's A is the same either way.
+    late = ResidualAdapter(ResidualConfig(rank=4), _arch(12)).init_params()
+    explicit = ResidualAdapter(
+        ResidualConfig(rank=4, layers=[3, 8]), _arch(12)
+    ).init_params()
+    np.testing.assert_array_equal(late[layer_key(8)]["A"], explicit[layer_key(8)]["A"])
+
+
+@pytest.mark.parametrize(
+    ("layers", "match"),
+    [
+        ([12], "only 12 transformer layers"),
+        ([-1], "non-negative"),
+        ([7, 7], "Duplicate"),
+    ],
+)
+def test_explicit_layers_validated_against_model(layers: list[int], match: str) -> None:
+    cfg = ResidualConfig(rank=2, layers=layers)
+    with pytest.raises(ValueError, match=match):
+        ResidualAdapter(cfg, _arch(12))
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"layers": []},
+        {"layers": [7.0]},
+        {"layers": [True]},
+        {"layers": 7},
+        {"layers": "7,8"},
+    ],
+)
+def test_config_rejects_invalid_layers(kwargs: dict[str, object]) -> None:
+    with pytest.raises(ValueError, match="layers must be"):
+        ResidualConfig(**kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "kwargs", [{"late_start": 7}, {"late_end": 9}, {"late_start": 7, "late_end": 9}]
+)
+def test_config_rejects_layers_with_late_bounds(kwargs: dict[str, int]) -> None:
+    with pytest.raises(ValueError, match="not both"):
+        ResidualConfig(rank=2, layers=[7, 8], **kwargs)

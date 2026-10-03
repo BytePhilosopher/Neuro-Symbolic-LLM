@@ -40,7 +40,7 @@ ACTIVATIONS: Mapping[str, Callable[[jax.Array], jax.Array]] = MappingProxyType(
     }
 )
 
-MIN_NUM_LAYERS = 4
+MIN_NUM_LAYERS = 5
 
 
 @dataclass(frozen=True)
@@ -53,6 +53,9 @@ class ResidualConfig:
     init_std: float | None = None
     late_start: int | None = None
     late_end: int | None = None
+    # Explicit blocks to adapt; overrides the late range entirely. Any valid
+    # block index is allowed; mutually exclusive with late_start / late_end.
+    layers: list[int] | None = None
     seed: int = 0
 
     def __post_init__(self) -> None:
@@ -71,6 +74,24 @@ class ResidualConfig:
             value = getattr(self, name)
             if value is not None and not isinstance(value, int):
                 raise ValueError(f"{name} must be an integer or null, got {value!r}")
+        if self.layers is not None:
+            if (
+                not isinstance(self.layers, list | tuple)
+                or not self.layers
+                or not all(
+                    isinstance(i, int) and not isinstance(i, bool) for i in self.layers
+                )
+            ):
+                raise ValueError(
+                    f"layers must be a non-empty list of integers or null, "
+                    f"got {self.layers!r}"
+                )
+            if self.late_start is not None or self.late_end is not None:
+                raise ValueError(
+                    "Set either layers or late_start/late_end, not both "
+                    f"(layers={self.layers!r}, late_start={self.late_start!r}, "
+                    f"late_end={self.late_end!r})."
+                )
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> ResidualConfig:
@@ -84,6 +105,8 @@ class ResidualConfig:
 
 
 def _checked_kwargs(cls: type, data: Mapping[str, Any]) -> dict[str, Any]:
+    # Private on purpose: residual/ must not depend on stages/, where the
+    # public copy (stages.common.checked_kwargs) lives.
     known = {f.name for f in fields(cls)}
     unknown = sorted(set(data) - known)
     if unknown:
@@ -127,18 +150,26 @@ def layer_key(layer_idx: int) -> str:
 
 
 class ResidualAdapter:
-    """Low-rank residual on the hidden states of the late frozen blocks."""
+    """Low-rank residual on the hidden states of frozen blocks.
+
+    By default the late blocks (``resolve_late_layers``); ``config.layers``
+    selects any blocks explicitly instead.
+    """
 
     def __init__(self, config: ResidualConfig, architecture: Architecture) -> None:
         self.config = config
         self.architecture = architecture
         self.hidden_size = architecture.hidden_size
-        self.layers = validate_interception_layers(
-            resolve_late_layers(
+        # Explicit layers skip the late-range rule; both paths go through the
+        # substrate's check (in range, unique) and come out sorted.
+        requested = (
+            config.layers
+            if config.layers is not None
+            else resolve_late_layers(
                 architecture.num_layers, config.late_start, config.late_end
-            ),
-            architecture.num_layers,
+            )
         )
+        self.layers = validate_interception_layers(requested, architecture.num_layers)
         self.scale = config.scale
         # 1/sqrt(d) keeps each component of h @ A at roughly the per-feature scale of h.
         self.init_std = (
@@ -167,16 +198,22 @@ class ResidualAdapter:
             for idx in self.layers
         }
 
+    def encode(self, layer_params: Mapping[str, jax.Array], h: jax.Array) -> jax.Array:
+        """Rank-``r`` code ``z = sigma(h @ A)`` in float32."""
+        # Upcast so the rank-r bottleneck does not lose precision on bf16/fp16
+        # substrates. Shapes: [..., d] @ [d, r] -> [..., r].
+        h32 = h.astype(jnp.float32)
+        return self._activation(h32 @ layer_params["A"])
+
+    def decode(self, layer_params: Mapping[str, jax.Array], z: jax.Array) -> jax.Array:
+        """``s * z @ B``: the code mapped back to hidden size, ``[..., r] -> [..., d]``."""
+        return self.scale * (z @ layer_params["B"])
+
     def residual(
         self, layer_params: Mapping[str, jax.Array], h: jax.Array
     ) -> jax.Array:
         """``s * sigma(h @ A) @ B`` in float32 (not yet cast back)."""
-        # Upcast so the rank-r bottleneck does not lose precision on bf16/fp16
-        # substrates. Shapes: [..., d] @ [d, r] -> [..., r] @ [r, d] -> [..., d].
-        h32 = h.astype(jnp.float32)
-        return self.scale * (
-            self._activation(h32 @ layer_params["A"]) @ layer_params["B"]
-        )
+        return self.decode(layer_params, self.encode(layer_params, h))
 
     def apply(self, params: AdapterParams, h: jax.Array, layer_idx: int) -> jax.Array:
         """Adapted hidden state; blocks without an entry pass through unchanged."""

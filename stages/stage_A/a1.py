@@ -10,14 +10,15 @@ passed by keyword and never receives gradients.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from typing import Any
 
 import jax
 
-from frozenllm.substrate import FrozenSubstrate, identity_modify
+from frozenllm.substrate import FrozenSubstrate
 from metrics.performance import cross_entropy_loss, kl_to_base
 from residual import AdapterParams, ResidualAdapter
+from stages.common import base_logits, checked_kwargs
 
 
 @dataclass(frozen=True)
@@ -36,22 +37,7 @@ class A1Config:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> A1Config:
         """Build from a mapping, rejecting unknown keys."""
-        known = {f.name for f in fields(cls)}
-        unknown = sorted(set(data) - known)
-        if unknown:
-            raise ValueError(
-                f"Unknown A1Config keys: {unknown}. Allowed: {sorted(known)}."
-            )
-        return cls(**data)
-
-
-def base_logits(substrate: FrozenSubstrate, input_ids: jax.Array) -> jax.Array:
-    """Logits of the unmodified base model ``F0``, with gradients stopped."""
-    # Empty intercept_layers: no hooks are attached, so this is the plain base forward.
-    result = substrate.run_with_interception(
-        input_ids, modify_fn=identity_modify, intercept_layers=()
-    )
-    return jax.lax.stop_gradient(result.logits)
+        return cls(**checked_kwargs(cls, data))
 
 
 def a1_objective(
@@ -69,24 +55,34 @@ def a1_objective(
     ``labels`` default to ``input_ids`` (the next-token shift is done by the
     loss). ``base`` may carry precomputed base logits; either way they are
     passed through ``stop_gradient``.
+
+    ``terms`` always has ``"total"``, ``"task"`` and ``"wd"``. ``"kl"`` is
+    present when it is part of the loss or free to compute: if
+    ``config.lambda_kl == 0`` and no ``base`` is passed, the base forward is
+    skipped and ``"kl"`` is omitted (not NaN: ``RunWriter.log`` would write a
+    bare ``NaN``, which strict JSON parsers reject). Eval KL is unaffected;
+    ``stages.common.evaluate`` always computes it.
     """
     adapted = substrate.run_with_interception(
         input_ids,
         modify_fn=adapter.modify_fn(params),
         intercept_layers=adapter.layers,
     ).logits
+    task = cross_entropy_loss(adapted, input_ids if labels is None else labels)
+    wd = ResidualAdapter.l2_norm_sq(params)
+    if config.lambda_kl == 0 and base is None:
+        total = task + config.lambda_wd * wd
+        return total, {"total": total, "task": task, "wd": wd}
     base = (
         base_logits(substrate, input_ids)
         if base is None
         else jax.lax.stop_gradient(base)
     )
-    task = cross_entropy_loss(adapted, input_ids if labels is None else labels)
     # Forward KL with the base as the target: penalises the adapter for dropping
     # probability mass the base assigns, keeping it near F0.
     kl = kl_to_base(base, adapted)
-    wd = ResidualAdapter.l2_norm_sq(params)
     total = task + config.lambda_kl * kl + config.lambda_wd * wd
     return total, {"total": total, "task": task, "kl": kl, "wd": wd}
 
 
-__all__ = ["A1Config", "a1_objective", "base_logits"]
+__all__ = ["A1Config", "a1_objective"]

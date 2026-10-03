@@ -7,6 +7,7 @@ adapter:
   init_std: null        # null → 1/sqrt(d)
   late_start: null      # null → L//2 + 1
   late_end: null        # null → L - 2
+  layers: null          # e.g. [6, 10]: explicit blocks; excludes late_start/late_end
   seed: 0
 objective:
   lambda_kl: 0.0        # [team] default, to be swept; KL is always logged

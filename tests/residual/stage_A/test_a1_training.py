@@ -8,8 +8,6 @@ isolation, and that training moves only the adapter.
 
 from __future__ import annotations
 
-import importlib.util
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +21,8 @@ import torch
 from frozenllm.substrate import FrozenSubstrate
 from metrics.performance import cross_entropy_loss, kl_to_base
 from residual import AdapterParams, ResidualAdapter, ResidualConfig, layer_key
-from stages.stage_A.a1 import A1Config, a1_objective, base_logits
+from stages.common import base_logits, load_configs
+from stages.stage_A.a1 import A1Config, a1_objective
 from tests.frozenllm.conftest import BATCH, NUM_TOKENS, SEQ, make_substrate
 
 FAMILIES = ("gpt2", "neox")
@@ -235,6 +234,38 @@ def test_objective_kl_and_wd_contribute_gradients(
     assert not np.allclose(grad_b(A1Config(lambda_wd=1.0)), plain)
 
 
+def test_objective_skips_base_forward_when_kl_unused(
+    substrate: FrozenSubstrate,
+    adapter: ResidualAdapter,
+    input_ids: jax.Array,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    params = _with_random_b(adapter.init_params())
+    cfg = A1Config(lambda_wd=0.1)
+    with_kl, with_kl_terms = a1_objective(
+        params,
+        substrate=substrate,
+        adapter=adapter,
+        config=cfg,
+        input_ids=input_ids,
+        base=base_logits(substrate, input_ids),
+    )
+
+    def no_base(*args: Any, **kwargs: Any) -> jax.Array:
+        raise AssertionError("base forward must be skipped when lambda_kl == 0")
+
+    monkeypatch.setattr("stages.stage_A.a1.base_logits", no_base)
+    total, terms = a1_objective(
+        params, substrate=substrate, adapter=adapter, config=cfg, input_ids=input_ids
+    )
+    # Omitted, not NaN, so metrics.jsonl stays strict JSON.
+    assert set(terms) == {"total", "task", "wd"}
+    assert set(with_kl_terms) == {"total", "task", "kl", "wd"}
+    # Dropping the zero-weighted KL leaves the loss unchanged.
+    np.testing.assert_allclose(float(total), float(with_kl), rtol=1e-6)
+    np.testing.assert_allclose(float(terms["task"]), float(with_kl_terms["task"]))
+
+
 # ── optimizer isolation and training ─────────────────────────────────────────
 
 
@@ -264,7 +295,7 @@ def test_training_moves_only_the_adapter(
     grad_fn = jax.value_and_grad(a1_objective, has_aux=True)
     cfg = A1Config()
 
-    tasks, kls = [], []
+    tasks = []
     for _ in range(5):
         (_, terms), grads = grad_fn(
             params,
@@ -279,10 +310,15 @@ def test_training_moves_only_the_adapter(
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
         tasks.append(float(terms["task"]))
-        kls.append(float(terms["kl"]))
 
+    # lambda_kl = 0 skips KL during training; passing base makes it report KL.
     (_, final), _ = grad_fn(
-        params, substrate=substrate, adapter=adapter, config=cfg, input_ids=input_ids
+        params,
+        substrate=substrate,
+        adapter=adapter,
+        config=cfg,
+        input_ids=input_ids,
+        base=base_logits(substrate, input_ids),
     )
     assert float(final["task"]) < tasks[0]
     assert float(final["kl"]) > 0.0
@@ -308,24 +344,10 @@ def test_a1_config_rejects_unknown_keys() -> None:
         A1Config.from_dict({"lambda_kl": 0.1, "lambda_pc": 1.0})
 
 
-def _load_runner(monkeypatch: pytest.MonkeyPatch) -> Any:
-    # experiments/ is a script directory, not a package; load the runner by path.
-    # It must be in sys.modules while executing so its dataclasses resolve.
-    path = REPO_ROOT / "experiments" / "run_stage_a1.py"
-    spec = importlib.util.spec_from_file_location("run_stage_a1", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, spec.name, module)
-    spec.loader.exec_module(module)
-    return module
-
-
-def test_shipped_yaml_loads_and_rejects_unknown_keys(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    load_configs = _load_runner(monkeypatch).load_configs
-
-    cfg = load_configs(REPO_ROOT / "configs" / "stage_A" / "a1_lora_baseline.yaml")
+def test_shipped_yaml_loads_and_rejects_unknown_keys(tmp_path: Path) -> None:
+    cfg = load_configs(
+        REPO_ROOT / "configs" / "stage_A" / "a1_lora_baseline.yaml", A1Config
+    )
     assert cfg.adapter == ResidualConfig()
     assert cfg.objective == A1Config()
     assert cfg.training.model == "gpt2"
@@ -333,10 +355,10 @@ def test_shipped_yaml_loads_and_rejects_unknown_keys(
 
     domains = "domains:\n  - {name: d, dataset: x}\n"
     bad_key = tmp_path / "bad_key.yaml"
-    bad_key.write_text("adapter:\n  rank: 4\n  layers: [7, 8]\n" + domains)
+    bad_key.write_text("adapter:\n  rank: 4\n  dropout: 0.1\n" + domains)
     with pytest.raises(ValueError, match="Unknown ResidualConfig keys"):
-        load_configs(bad_key)
+        load_configs(bad_key, A1Config)
     bad_section = tmp_path / "bad_section.yaml"
     bad_section.write_text("optimizer:\n  name: adamw\n")
     with pytest.raises(ValueError, match="Unknown config sections"):
-        load_configs(bad_section)
+        load_configs(bad_section, A1Config)
