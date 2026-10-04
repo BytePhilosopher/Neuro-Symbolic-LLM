@@ -388,4 +388,4 @@ def test_config_rejects_invalid_layers(kwargs: dict[str, object]) -> None:
 )
 def test_config_rejects_layers_with_late_bounds(kwargs: dict[str, int]) -> None:
     with pytest.raises(ValueError, match="not both"):
-        ResidualConfig(rank=2, layers=[7, 8], **kwargs)
+        ResidualConfig(rank=2, layers=[7, 8], **kwargs)  # type: ignore[arg-type]

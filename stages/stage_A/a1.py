@@ -1,6 +1,6 @@
 """Stage A1: plain residual baseline (no predictive coding, no symbolic head).
 
-    L_A1 = L_task + lambda_kl * KL(p_F0 || p_F0+R) + lambda_wd * ||phi||^2
+L_A1 = L_task + lambda_kl * KL(p_F0 || p_F0+R) + lambda_wd * ||phi||^2
 """
 
 from __future__ import annotations
