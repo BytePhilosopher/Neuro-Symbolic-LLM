@@ -397,7 +397,11 @@ def _fmt_losses(row: Mapping[str, Mapping[str, float]]) -> str:
 def _fmt_terms(scalars: Mapping[str, float]) -> str:
     extra = (f"{k}={v:.3e}" for k, v in scalars.items() if k not in ("total", "task"))
     return " ".join(
-        [f"total={scalars['total']:.4f}", f"task_loss={scalars['task']:.4f}", *extra]
+        [
+            f"total_loss={scalars['total']:.4f}",
+            f"task_loss={scalars['task']:.4f}",
+            *extra,
+        ]
     )
 
 
