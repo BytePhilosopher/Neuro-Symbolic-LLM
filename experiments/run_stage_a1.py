@@ -1,15 +1,9 @@
 """Run Stage A1: train a hidden-state residual adapter on a frozen LM.
 
-Wiring only: parse arguments, load the substrate, build the configs and the
-adapter, then hand the A1 objective to the shared sequential loop in
-``stages/common.py`` (train with ``optax.adam`` over the adapter PyTree on a
-sequence of domains, evaluating every domain after every task). Writes the
-run to disk and checks that the base parameters are unchanged.
+Wiring only: builds the configs, substrate and adapter, then runs the shared
+loop in ``stages/stage_base.py`` and checks the base is unchanged.
 
     python experiments/run_stage_a1.py --config configs/stage_A/a1_lora_baseline.yaml
-
-A single-domain config is a sequence of length one. Artifacts are written to
-``<output_dir>/<run_name>/``; see ``stages/results.py`` for the layout.
 """
 
 from __future__ import annotations
@@ -22,13 +16,15 @@ from dataclasses import replace
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-# Run as a script, so the repo root is not on sys.path by default.
+# Run as a script: put the repo root on sys.path.
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from frozenllm.substrate import FrozenSubstrate  # noqa: E402
 from residual import ResidualAdapter  # noqa: E402
-from stages.common import (  # noqa: E402
+from stages.results import RunWriter, default_run_name, run_metadata  # noqa: E402
+from stages.stage_A.a1 import A1Config, a1_objective  # noqa: E402
+from stages.stage_base import (  # noqa: E402
     Domain,
     RunConfig,
     load_configs,
@@ -36,8 +32,6 @@ from stages.common import (  # noqa: E402
     make_eval_set,
     run_sequential,
 )
-from stages.results import RunWriter, default_run_name, run_metadata  # noqa: E402
-from stages.stage_A.a1 import A1Config, a1_objective  # noqa: E402
 
 DEFAULT_CONFIG = REPO_ROOT / "configs" / "stage_A" / "a1_lora_baseline.yaml"
 
@@ -108,8 +102,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         log.error("Substrate not frozen before training: %s", frozen)
         return 1
 
-    # Load all data before creating the run directory, so a bad dataset id
-    # fails fast without leaving an empty run behind.
+    # Load data before creating the run directory, so bad datasets fail fast.
     domains = []
     for d in cfg.domains:
         train_blocks = load_token_blocks(substrate, d, d.train_split, train_cfg.seq_len)

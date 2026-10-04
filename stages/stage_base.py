@@ -1,13 +1,7 @@
-"""Shared training machinery for the stage runners.
+"""Shared stage machinery: configs, data loading, the sequential loop and summaries.
 
-How any stage loads data, trains, evaluates and summarises a run: the
-``training:``/``domains:`` configs, token-block loading, the sequential
-multi-domain loop and the continual-learning summary. Stage-specific code
-(objective config and loss) lives in ``stages/stage_<X>/``; run artifacts are
-written by ``stages/results.py``.
-
-A stage plugs in by passing its objective config class to ``load_configs``
-and its objective function (see ``Objective``) to ``run_sequential``.
+A stage plugs in its objective config class (``load_configs``) and its objective
+function (``run_sequential``); stage-specific code lives in ``stages/stage_<X>/``.
 """
 
 from __future__ import annotations
@@ -46,10 +40,6 @@ log = logging.getLogger(__name__)
 
 
 def checked_kwargs(cls: type, data: Mapping[str, Any]) -> dict[str, Any]:
-    """Return ``data`` as kwargs for dataclass ``cls``, rejecting unknown keys.
-
-    Used by every stage config's ``from_dict``.
-    """
     known = {f.name for f in fields(cls)}
     unknown = sorted(set(data) - known)
     if unknown:
@@ -60,14 +50,9 @@ def checked_kwargs(cls: type, data: Mapping[str, Any]) -> dict[str, Any]:
 
 
 class Objective(Protocol):
-    """Signature every stage objective must have to run under ``run_sequential``.
+    """Stage objective: differentiates ``params``, returns ``(total, terms)``."""
 
-    Only ``params`` (the adapter PyTree) is differentiated; everything else is
-    passed by keyword. ``labels`` default to ``input_ids``; ``base`` may carry
-    precomputed base logits. Returns ``(total, terms)``, where ``terms`` holds
-    scalar arrays with at least ``"total"`` and ``"task"``; any further terms
-    are logged as they are.
-    """
+    # ``terms`` must hold "total" and "task"; extra terms are logged as-is.
 
     def __call__(
         self,
@@ -89,14 +74,13 @@ class TrainingConfig:
     model: str = "gpt2"
     seq_len: int = 128
     batch_size: int = 8
-    # Default steps per domain; a domain's own ``steps`` overrides it.
+    # Default steps per domain; a domain's ``steps`` overrides it.
     steps: int = 200
     learning_rate: float = 1.0e-3
     eval_batches: int = 8
     log_every: int = 10
     seed: int = 0
-    # Fresh Adam moments at each domain boundary, so stale moments from the
-    # previous domain do not steer the first steps on the next one.
+    # Fresh Adam moments at each domain boundary.
     reset_optimizer: bool = True
     output_dir: str = "runs"
 
@@ -116,10 +100,7 @@ class TrainingConfig:
 
 @dataclass(frozen=True)
 class DomainConfig:
-    """One domain of the sequence; an item of the ``domains:`` YAML list.
-
-    Splits accept HF slicing, e.g. ``train[:20000]`` or ``test[:1000]+test[-1000:]``.
-    """
+    """One ``domains:`` item; splits accept HF slicing, e.g. ``train[:20000]``."""
 
     name: str
     dataset: str
@@ -127,8 +108,7 @@ class DomainConfig:
     text_field: str = "text"
     train_split: str = "train"
     eval_split: str = "validation"
-    # Joins documents into one token stream. WikiText lines already end in
-    # "\n", so "" keeps it contiguous; use "\n\n" for one-document-per-row sets.
+    # Joins rows into one stream; use "\n\n" for one-document-per-row datasets.
     separator: str = ""
     steps: int | None = None
 
@@ -149,14 +129,15 @@ class DomainConfig:
 
 @dataclass(frozen=True)
 class RunConfig:
+    """Full run config; mirrors the YAML file."""
+
     adapter: ResidualConfig
-    # The stage's objective config: any frozen dataclass with ``from_dict``.
+    # Stage objective config: any frozen dataclass with ``from_dict``.
     objective: Any
     training: TrainingConfig
     domains: tuple[DomainConfig, ...]
 
     def to_dict(self) -> dict[str, Any]:
-        """Same layout as the YAML file; ``load_configs`` reads it back."""
         return {
             "adapter": asdict(self.adapter),
             "objective": asdict(self.objective),
@@ -166,10 +147,7 @@ class RunConfig:
 
 
 def load_configs(path: Path, objective_cls: type[Any]) -> RunConfig:
-    """Parse the YAML file into a ``RunConfig``.
-
-    The ``objective:`` section is built with ``objective_cls.from_dict``.
-    """
+    """Parse a YAML file into a ``RunConfig``, building ``objective:`` with ``objective_cls``."""
     raw = yaml.safe_load(path.read_text()) or {}
     unknown = sorted(set(raw) - set(SECTIONS))
     if unknown:
@@ -202,7 +180,7 @@ class Domain:
 def load_token_blocks(
     substrate: FrozenSubstrate, domain: DomainConfig, split: str, seq_len: int
 ) -> np.ndarray:
-    """Tokenize a dataset split and cut it into ``[n, seq_len]`` blocks."""
+    """Tokenize a dataset split into contiguous ``[n, seq_len]`` blocks."""
     from datasets import load_dataset
 
     if substrate.tokenizer is None:
@@ -227,7 +205,7 @@ def load_token_blocks(
 def make_eval_set(
     blocks: np.ndarray, batch_size: int, eval_batches: int
 ) -> tuple[jax.Array, ...]:
-    """Fixed, unshuffled eval batches, so every evaluation sees the same data."""
+    """Return fixed, unshuffled eval batches."""
     n_eval = min(len(blocks), eval_batches * batch_size)
     return tuple(
         jnp.asarray(blocks[i : i + batch_size]) for i in range(0, n_eval, batch_size)
@@ -235,7 +213,7 @@ def make_eval_set(
 
 
 def batches(blocks: np.ndarray, batch_size: int, seed: int) -> Iterator[jax.Array]:
-    """Endless, seeded stream of shuffled batches."""
+    """Yield an endless, seeded stream of shuffled batches."""
     if len(blocks) < batch_size:
         raise ValueError(f"{len(blocks)} blocks cannot fill batch_size={batch_size}.")
     rng = np.random.default_rng(seed)
@@ -247,8 +225,8 @@ def batches(blocks: np.ndarray, batch_size: int, seed: int) -> Iterator[jax.Arra
 
 
 def base_logits(substrate: FrozenSubstrate, input_ids: jax.Array) -> jax.Array:
-    """Logits of the unmodified base model ``F0``, with gradients stopped."""
-    # Empty intercept_layers: no hooks are attached, so this is the plain base forward.
+    """Return base-model ``F0`` logits with gradients stopped."""
+    # No intercept layers: a plain base forward.
     result = substrate.run_with_interception(
         input_ids, modify_fn=identity_modify, intercept_layers=()
     )
@@ -261,7 +239,7 @@ def evaluate(
     params: AdapterParams,
     eval_batches: Sequence[jax.Array],
 ) -> dict[str, float]:
-    """Mean base/adapted loss, perplexity and KL over fixed eval batches."""
+    """Return mean base/adapted loss, perplexity and KL over ``eval_batches``."""
     base_losses, losses, kls = [], [], []
     for ids in eval_batches:
         base = base_logits(substrate, ids)
@@ -286,11 +264,7 @@ def summarize(
     init: Mapping[str, Mapping[str, float]],
     rows: Sequence[Mapping[str, Mapping[str, float]]],
 ) -> dict[str, Any]:
-    """Build the eval matrices and continual-learning summaries.
-
-    Matrices are ``M[t][j]``: domain ``j`` evaluated after training task ``t``.
-    Loss is the task metric, so forgetting uses ``higher_is_better=False``.
-    """
+    """Return ``[t][j]`` eval matrices, mean seen loss and mean forgetting."""
     loss = np.array([[row[n]["loss"] for n in names] for row in rows])
     base_loss = [init[n]["base_loss"] for n in names]
     num_tasks = len(rows)
@@ -329,14 +303,7 @@ def run_sequential(
     training: TrainingConfig,
     writer: RunWriter,
 ) -> tuple[AdapterParams, dict[str, Any]]:
-    """Train on ``domains`` in order, evaluating every domain after every task.
-
-    ``objective_fn`` is called with ``config=objective_cfg``. Writes
-    ``train``/``eval`` events to ``metrics.jsonl`` (every term the objective
-    returns, as ``loss_<term>``) and the adapter after each task to
-    ``params/task_<t>_<name>.npz``. Returns the final parameters and the
-    summary from ``summarize`` plus step and token counts.
-    """
+    """Train on ``domains`` in order, evaluating all after each task; return ``(params, summary)``."""
     if not domains:
         raise ValueError("At least one domain is required.")
     names = [d.name for d in domains]
@@ -349,7 +316,7 @@ def run_sequential(
         log.info("eval after_task=%d %s", after_task, _fmt_losses(row))
         return row
 
-    # after_task=-1: before any training, where the adapted model equals the base.
+    # after_task=-1: before training, where adapted equals base.
     init = eval_all(-1)
 
     optimizer = optax.adam(training.learning_rate)
@@ -358,8 +325,7 @@ def run_sequential(
     def train_step(
         params: AdapterParams, opt_state: optax.OptState, ids: jax.Array
     ) -> tuple[AdapterParams, optax.OptState, dict[str, jax.Array]]:
-        # No precomputed base: the objective runs the base forward itself if it
-        # needs one, so each step can cost two substrate forwards.
+        # No precomputed base: the objective runs its own base forward if needed.
         (_, terms), grads = grad_fn(
             params,
             substrate=substrate,
@@ -370,8 +336,7 @@ def run_sequential(
         updates, opt_state = optimizer.update(grads, opt_state, params)
         return optax.apply_updates(params, updates), opt_state, terms
 
-    # The optimizer only ever sees the adapter PyTree; base weights are torch
-    # tensors outside it and cannot be updated.
+    # The optimizer only sees the adapter PyTree; base weights live outside it.
     opt_state = optimizer.init(params)
     rows: list[dict[str, dict[str, float]]] = []
     step_times: list[float] = []
@@ -381,7 +346,7 @@ def run_sequential(
         if t > 0 and training.reset_optimizer:
             opt_state = optimizer.init(params)
         log.info("task=%d domain=%s steps=%d", t, domain.name, domain.steps)
-        # Per-task seed so domain t's batch order does not depend on earlier tasks.
+        # Per-task seed: batch order is independent of earlier tasks.
         stream = batches(domain.train_blocks, training.batch_size, training.seed + t)
         for step in range(1, domain.steps + 1):
             ids = next(stream)
@@ -401,7 +366,7 @@ def run_sequential(
                 tokens=tokens,
                 step_time=step_time,
                 ppl=float(perplexity(scalars["task"])),
-                # Prefixed: the objective's "task" term would clash with the task index.
+                # Prefixed so the "task" term does not clash with the task index.
                 **{f"loss_{k}": v for k, v in scalars.items()},
             )
             if step % training.log_every == 0 or step in (1, domain.steps):
@@ -419,7 +384,7 @@ def run_sequential(
     summary.update(
         steps=global_step,
         tokens=tokens,
-        # The first step includes tracing; leave it out of the steady-state mean.
+        # Exclude the first step, which includes tracing.
         mean_step_time=float(np.mean(step_times[1:])) if len(step_times) > 1 else None,
     )
     return params, summary
@@ -430,8 +395,6 @@ def _fmt_losses(row: Mapping[str, Mapping[str, float]]) -> str:
 
 
 def _fmt_terms(scalars: Mapping[str, float]) -> str:
-    # total and task are always present; the remaining terms are whatever the
-    # objective returned, in its order.
     extra = (f"{k}={v:.3e}" for k, v in scalars.items() if k not in ("total", "task"))
     return " ".join(
         [f"total={scalars['total']:.4f}", f"task_loss={scalars['task']:.4f}", *extra]

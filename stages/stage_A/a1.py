@@ -1,10 +1,6 @@
-"""Stage A1: ordinary residual baseline.
+"""Stage A1: plain residual baseline (no predictive coding, no symbolic head).
 
     L_A1 = L_task + lambda_kl * KL(p_F0 || p_F0+R) + lambda_wd * ||phi||^2
-
-No predictive coding and no symbolic head. Only the adapter parameters
-``phi`` (the first positional argument) are differentiated; the substrate is
-passed by keyword and never receives gradients.
 """
 
 from __future__ import annotations
@@ -18,7 +14,7 @@ import jax
 from frozenllm.substrate import FrozenSubstrate
 from metrics.performance import cross_entropy_loss, kl_to_base
 from residual import AdapterParams, ResidualAdapter
-from stages.common import base_logits, checked_kwargs
+from stages.stage_base import base_logits, checked_kwargs
 
 
 @dataclass(frozen=True)
@@ -36,7 +32,6 @@ class A1Config:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> A1Config:
-        """Build from a mapping, rejecting unknown keys."""
         return cls(**checked_kwargs(cls, data))
 
 
@@ -50,19 +45,7 @@ def a1_objective(
     labels: jax.Array | None = None,
     base: jax.Array | None = None,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
-    """Return ``(total, terms)`` for one batch.
-
-    ``labels`` default to ``input_ids`` (the next-token shift is done by the
-    loss). ``base`` may carry precomputed base logits; either way they are
-    passed through ``stop_gradient``.
-
-    ``terms`` always has ``"total"``, ``"task"`` and ``"wd"``. ``"kl"`` is
-    present when it is part of the loss or free to compute: if
-    ``config.lambda_kl == 0`` and no ``base`` is passed, the base forward is
-    skipped and ``"kl"`` is omitted (not NaN: ``RunWriter.log`` would write a
-    bare ``NaN``, which strict JSON parsers reject). Eval KL is unaffected;
-    ``stages.common.evaluate`` always computes it.
-    """
+    """Return ``(total, terms)`` for one batch; ``kl`` is omitted if unweighted and no ``base``."""
     adapted = substrate.run_with_interception(
         input_ids,
         modify_fn=adapter.modify_fn(params),
@@ -70,6 +53,7 @@ def a1_objective(
     ).logits
     task = cross_entropy_loss(adapted, input_ids if labels is None else labels)
     wd = ResidualAdapter.l2_norm_sq(params)
+    # Skip the base forward; omit "kl" rather than NaN, which strict JSON rejects.
     if config.lambda_kl == 0 and base is None:
         total = task + config.lambda_wd * wd
         return total, {"total": total, "task": task, "wd": wd}
@@ -78,8 +62,7 @@ def a1_objective(
         if base is None
         else jax.lax.stop_gradient(base)
     )
-    # Forward KL with the base as the target: penalises the adapter for dropping
-    # probability mass the base assigns, keeping it near F0.
+    # Forward KL to the base keeps the adapted model near F0.
     kl = kl_to_base(base, adapted)
     total = task + config.lambda_kl * kl + config.lambda_wd * wd
     return total, {"total": total, "task": task, "kl": kl, "wd": wd}

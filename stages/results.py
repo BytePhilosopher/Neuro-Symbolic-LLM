@@ -1,7 +1,4 @@
-"""On-disk run artifacts shared by the stage runners.
-
-One run is one directory, created fresh (an existing directory is never
-overwritten)::
+"""Run artifacts shared by the stage runners; one fresh directory per run::
 
     <root>/<run_name>/
         config.yaml          resolved config; can be passed back to the runner
@@ -10,9 +7,8 @@ overwritten)::
         results.json         end-of-run summary, written by the runner
         params/<tag>.npz     adapter parameters, keys "<layer>/<leaf>"
 
-JSON files are written atomically (temp file + rename), so a crashed run
-leaves either the previous version or none, never a truncated file.
-``metrics.jsonl`` is flushed per line so a partial run is still readable.
+JSON is written atomically and ``metrics.jsonl`` is flushed per line, so a
+crashed run never leaves a truncated file.
 """
 
 from __future__ import annotations
@@ -35,7 +31,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _to_json(value: Any) -> Any:
-    """Convert numpy/JAX scalars and arrays to plain JSON types."""
     if isinstance(value, Mapping):
         return {str(k): _to_json(v) for k, v in value.items()}
     if isinstance(value, list | tuple):
@@ -74,7 +69,7 @@ def _git(*args: str) -> str | None:
 
 
 def run_metadata() -> dict[str, Any]:
-    """Provenance for a run: commit, dirty flag, versions, start time (UTC)."""
+    """Return run provenance: commit, dirty flag, versions, argv, start time (UTC)."""
     versions: dict[str, str] = {}
     for name in ("jax", "jaxlib", "optax", "numpy", "torch", "transformers"):
         module = sys.modules.get(name)
@@ -93,16 +88,13 @@ def run_metadata() -> dict[str, Any]:
 
 
 def default_run_name(prefix: str) -> str:
-    """``<prefix>-YYYYmmdd-HHMMSS`` in UTC."""
+    """Return ``<prefix>-YYYYmmdd-HHMMSS`` in UTC."""
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     return f"{prefix}-{stamp}"
 
 
 class RunWriter:
-    """Writes one run's artifacts into ``root / run_name``.
-
-    Use as a context manager so ``metrics.jsonl`` is closed on exit.
-    """
+    """Writes one run's artifacts to ``root / run_name``; use as a context manager."""
 
     def __init__(self, root: Path | str, run_name: str) -> None:
         if not run_name or Path(run_name).name != run_name:
@@ -110,7 +102,7 @@ class RunWriter:
                 f"run_name must be a plain directory name, got {run_name!r}"
             )
         self.dir = Path(root) / run_name
-        # exist_ok=False: never mix artifacts from two runs.
+        # Never mix artifacts from two runs.
         self.dir.mkdir(parents=True, exist_ok=False)
         self._metrics: IO[str] | None = (self.dir / "metrics.jsonl").open("a")
 
@@ -162,7 +154,7 @@ class RunWriter:
 
 
 def load_params(path: Path | str) -> dict[str, dict[str, np.ndarray]]:
-    """Inverse of ``RunWriter.save_params``."""
+    """Load a checkpoint written by ``RunWriter.save_params``."""
     params: dict[str, dict[str, np.ndarray]] = {}
     with np.load(path) as data:
         for key in data.files:

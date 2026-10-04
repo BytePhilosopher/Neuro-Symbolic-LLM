@@ -1,6 +1,6 @@
 """Stage A1 sequential runner: configs, the multi-domain loop and run artifacts.
 
-The configs and the loop live in ``stages/common.py``; the runner script only
+The configs and the loop live in ``stages/stage_base.py``; the runner script only
 parses arguments. Runs ``run_sequential`` on the 12-layer GPT-2 fixture with synthetic token
 blocks, so no dataset download is needed.
 """
@@ -22,15 +22,15 @@ import pytest
 from frozenllm.substrate import FrozenSubstrate
 from metrics.performance import cross_entropy_loss
 from residual import AdapterParams, ResidualAdapter, ResidualConfig, layer_key
-from stages.common import (
+from stages.results import RunWriter, load_params
+from stages.stage_A.a1 import A1Config, a1_objective
+from stages.stage_base import (
     Domain,
     TrainingConfig,
     load_configs,
     make_eval_set,
     run_sequential,
 )
-from stages.results import RunWriter, load_params
-from stages.stage_A.a1 import A1Config, a1_objective
 from tests.frozenllm.conftest import BATCH, NUM_TOKENS, SEQ, make_substrate
 
 REPO_ROOT = Path(__file__).resolve().parents[3]

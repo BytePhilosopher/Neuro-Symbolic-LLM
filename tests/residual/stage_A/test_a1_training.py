@@ -21,8 +21,8 @@ import torch
 from frozenllm.substrate import FrozenSubstrate
 from metrics.performance import cross_entropy_loss, kl_to_base
 from residual import AdapterParams, ResidualAdapter, ResidualConfig, layer_key
-from stages.common import base_logits, load_configs
 from stages.stage_A.a1 import A1Config, a1_objective
+from stages.stage_base import base_logits, load_configs
 from tests.frozenllm.conftest import BATCH, NUM_TOKENS, SEQ, make_substrate
 
 FAMILIES = ("gpt2", "neox")

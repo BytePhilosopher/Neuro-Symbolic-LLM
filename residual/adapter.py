@@ -1,16 +1,9 @@
-"""Hidden-state residual adapter .
+"""Hidden-state residual adapter on frozen blocks.
 
-At each adapted block ``l`` the frozen block output ``h`` (row vectors of
-size ``d``) is replaced by
+    h~ = h + s * sigma(h @ A) @ B,   A: [d, r],  B: [r, d],  s = alpha / r (or 1.0)
 
-    h~ = h + s * sigma(h @ A_l) @ B_l,   A_l: [d, r],  B_l: [r, d]
-
-with ``s = alpha / r`` (``1.0`` if ``alpha`` is unset). ``A ~ N(0, init_std^2)``
-and ``B = 0``, so the adapted model equals the base model at initialisation.
-
-The adapter parameters are a PyTree that is independent of the substrate
-parameters; the only integration point is ``modify_fn(params)``, passed to
-``FrozenSubstrate.run_with_interception``.
+``B = 0`` at init, so the adapted model starts equal to the base. Parameters are
+a separate PyTree, applied through ``modify_fn`` hooks on the substrate.
 """
 
 from __future__ import annotations
@@ -53,8 +46,7 @@ class ResidualConfig:
     init_std: float | None = None
     late_start: int | None = None
     late_end: int | None = None
-    # Explicit blocks to adapt; overrides the late range entirely. Any valid
-    # block index is allowed; mutually exclusive with late_start / late_end.
+    # Explicit blocks; replaces the late range, exclusive with late_start/late_end.
     layers: list[int] | None = None
     seed: int = 0
 
@@ -95,7 +87,6 @@ class ResidualConfig:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> ResidualConfig:
-        """Build from a mapping, rejecting unknown keys."""
         return cls(**_checked_kwargs(cls, data))
 
     @property
@@ -105,8 +96,7 @@ class ResidualConfig:
 
 
 def _checked_kwargs(cls: type, data: Mapping[str, Any]) -> dict[str, Any]:
-    # Private on purpose: residual/ must not depend on stages/, where the
-    # public copy (stages.common.checked_kwargs) lives.
+    # Private copy so residual/ does not depend on stages/.
     known = {f.name for f in fields(cls)}
     unknown = sorted(set(data) - known)
     if unknown:
@@ -121,12 +111,7 @@ def resolve_late_layers(
     late_start: int | None = None,
     late_end: int | None = None,
 ) -> tuple[int, ...]:
-    """Return the adapted blocks: the inclusive range ``(L // 2, L - 2]``.
-
-    Defaults are ``late_start = L // 2 + 1`` and ``late_end = L - 2``. Bounds
-    must satisfy ``L // 2 < late_start <= late_end <= L - 2``; they are never
-    clamped.
-    """
+    """Return the adapted blocks ``(L // 2, L - 2]``; invalid bounds raise, never clamp."""
     l_mid = num_layers // 2
     start = l_mid + 1 if late_start is None else late_start
     end = num_layers - 2 if late_end is None else late_end
@@ -145,23 +130,17 @@ def resolve_late_layers(
 
 
 def layer_key(layer_idx: int) -> str:
-    """PyTree key of the adapter at block ``layer_idx``."""
     return f"layer_{layer_idx}"
 
 
 class ResidualAdapter:
-    """Low-rank residual on the hidden states of frozen blocks.
-
-    By default the late blocks (``resolve_late_layers``); ``config.layers``
-    selects any blocks explicitly instead.
-    """
+    """Low-rank residual on frozen block outputs (late blocks or ``config.layers``)."""
 
     def __init__(self, config: ResidualConfig, architecture: Architecture) -> None:
         self.config = config
         self.architecture = architecture
         self.hidden_size = architecture.hidden_size
-        # Explicit layers skip the late-range rule; both paths go through the
-        # substrate's check (in range, unique) and come out sorted.
+        # Both paths are validated by the substrate (in range, unique) and sorted.
         requested = (
             config.layers
             if config.layers is not None
@@ -171,7 +150,7 @@ class ResidualAdapter:
         )
         self.layers = validate_interception_layers(requested, architecture.num_layers)
         self.scale = config.scale
-        # 1/sqrt(d) keeps each component of h @ A at roughly the per-feature scale of h.
+        # 1/sqrt(d) keeps h @ A at roughly the per-feature scale of h.
         self.init_std = (
             config.init_std
             if config.init_std is not None
@@ -180,13 +159,11 @@ class ResidualAdapter:
         self._activation = ACTIVATIONS[config.activation]
 
     def init_params(self) -> AdapterParams:
-        """``A ~ N(0, init_std^2)`` and ``B = 0`` per layer, deterministic from seed."""
+        """Return ``A ~ N(0, init_std^2)``, ``B = 0`` per block, seeded."""
         base = jax.random.PRNGKey(self.config.seed)
         d, r = self.hidden_size, self.config.rank
-        # Keys are folded by block index, not position in self.layers, so a
-        # block's A does not change when late_start / late_end move.
-        # B = 0 makes the residual exactly zero while dL/dB = sigma(hA)^T dL/dh
-        # stays nonzero; A starts receiving gradient once B moves.
+        # Keys fold in the block index, so a block's A is stable if the range moves.
+        # B = 0 zeroes the residual while dL/dB stays non-zero.
         return {
             layer_key(idx): {
                 "A": self.init_std
@@ -199,24 +176,21 @@ class ResidualAdapter:
         }
 
     def encode(self, layer_params: Mapping[str, jax.Array], h: jax.Array) -> jax.Array:
-        """Rank-``r`` code ``z = sigma(h @ A)`` in float32."""
-        # Upcast so the rank-r bottleneck does not lose precision on bf16/fp16
-        # substrates. Shapes: [..., d] @ [d, r] -> [..., r].
+        """Return the rank-``r`` code ``z = sigma(h @ A)`` in float32."""
+        # Upcast so the bottleneck keeps precision on bf16/fp16 substrates.
         h32 = h.astype(jnp.float32)
         return self._activation(h32 @ layer_params["A"])
 
     def decode(self, layer_params: Mapping[str, jax.Array], z: jax.Array) -> jax.Array:
-        """``s * z @ B``: the code mapped back to hidden size, ``[..., r] -> [..., d]``."""
         return self.scale * (z @ layer_params["B"])
 
     def residual(
         self, layer_params: Mapping[str, jax.Array], h: jax.Array
     ) -> jax.Array:
-        """``s * sigma(h @ A) @ B`` in float32 (not yet cast back)."""
+        """Return ``decode(encode(h))`` in float32, not cast back."""
         return self.decode(layer_params, self.encode(layer_params, h))
 
     def apply(self, params: AdapterParams, h: jax.Array, layer_idx: int) -> jax.Array:
-        """Adapted hidden state; blocks without an entry pass through unchanged."""
         layer_params = params.get(layer_key(layer_idx))
         if layer_params is None:
             return h
@@ -224,10 +198,9 @@ class ResidualAdapter:
         return h + self.residual(layer_params, h).astype(h.dtype)
 
     def modify_fn(self, params: AdapterParams) -> Callable[[jax.Array, int], jax.Array]:
-        """A substrate ``ModifyFn`` ``(hidden, layer_idx) -> hidden`` over ``params``."""
+        """Return a substrate hook ``(hidden, layer_idx) -> hidden`` bound to ``params``."""
 
-        # Closing over params (possibly tracers) is what lets jax.grad reach the
-        # adapter through the substrate's forward hooks.
+        # Closing over params (possibly tracers) lets jax.grad reach the adapter.
         def modify(hidden: jax.Array, layer_idx: int) -> jax.Array:
             return self.apply(params, hidden, layer_idx)
 
@@ -235,12 +208,10 @@ class ResidualAdapter:
 
     @staticmethod
     def num_params(params: AdapterParams) -> int:
-        """Total number of trainable scalars in ``params``."""
         return sum(int(leaf.size) for leaf in jax.tree_util.tree_leaves(params))
 
     @staticmethod
     def l2_norm_sq(params: AdapterParams) -> jax.Array:
-        """``||phi||^2`` over all adapter parameters."""
         # Array-valued start so an empty PyTree still yields a float32 scalar.
         return sum(
             (jnp.sum(jnp.square(leaf)) for leaf in jax.tree_util.tree_leaves(params)),

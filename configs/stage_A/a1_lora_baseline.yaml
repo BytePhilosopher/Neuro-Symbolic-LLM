@@ -1,4 +1,4 @@
-# Hidden-state residual adapter (not weight-level LoRA). See residual/README.md.
+# Hidden-state residual adapter (not weight-level LoRA). See stages/stage_A/README.md.
 # Keys mirror ResidualConfig / A1Config / TrainingConfig / DomainConfig; unknown keys are rejected.
 adapter:
   rank: 16
