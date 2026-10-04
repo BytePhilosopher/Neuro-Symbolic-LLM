@@ -29,7 +29,7 @@ This is **not** weight-level LoRA: the adapter changes block *outputs*, and the 
 | **Base model** | Frozen (GPT-2 by default), run through `FrozenSubstrate` |
 | **Trainable part** | Low-rank residual on late blocks, $2 \cdot d \cdot r$ parameters per block |
 | **Objective** | Next-token cross-entropy, optional KL to the base, optional weight decay |
-| **Data** | WikiText-2 → AG News → IMDB, trained in sequence |
+| **Data** | Three related legal domains from LexGLUE, in sequence: EU legislation (EUR-Lex) → contracts (LEDGAR) → US case law (SCOTUS) |
 | **Optimizer** | `optax.adam`, over the adapter parameters only |
 | **Starting point** | Identical to the base model (zero residual at step 0) |
 
@@ -236,14 +236,18 @@ training:               # → TrainingConfig
   output_dir: runs
 
 domains:                # → DomainConfig each; trained in order, names unique
-  - name: wikitext2     # [A-Za-z0-9_.-]+, used in checkpoint file names
-    dataset: Salesforce/wikitext
-    dataset_config: wikitext-2-raw-v1
+  - name: eurlex        # [A-Za-z0-9_.-]+, used in checkpoint file names
+    dataset: coastalcph/lex_glue
+    dataset_config: eurlex
     text_field: text
-    train_split: train  # HF slicing works: "train[:20000]"
-    eval_split: validation
-    separator: ""       # "\n\n" for one-document-per-row datasets
+    train_split: "train[:5000]"   # HF slicing
+    eval_split: "validation[:500]"
+    separator: "\n\n"   # joins rows into one token stream
     steps: null         # null → training.steps
+  - name: ledgar        # contracts; same fields
+    ...
+  - name: scotus        # case law; same fields
+    ...
 ```
 
 ---

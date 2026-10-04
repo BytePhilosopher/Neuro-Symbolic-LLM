@@ -351,7 +351,7 @@ def test_shipped_yaml_loads_and_rejects_unknown_keys(tmp_path: Path) -> None:
     assert cfg.adapter == ResidualConfig()
     assert cfg.objective == A1Config()
     assert cfg.training.model == "gpt2"
-    assert [d.name for d in cfg.domains] == ["wikitext2", "ag_news", "imdb"]
+    assert [d.name for d in cfg.domains] == ["eurlex", "ledgar", "scotus"]
 
     domains = "domains:\n  - {name: d, dataset: x}\n"
     bad_key = tmp_path / "bad_key.yaml"

@@ -189,7 +189,7 @@ def test_config_round_trips_through_writer(
     shipped = load_configs(
         REPO_ROOT / "configs" / "stage_A" / "a1_lora_baseline.yaml", A1Config
     )
-    assert [d.name for d in shipped.domains] == ["wikitext2", "ag_news", "imdb"]
+    assert [d.name for d in shipped.domains] == ["eurlex", "ledgar", "scotus"]
     cfg = replace(shipped, adapter=adapter, objective=A1Config(lambda_kl=0.5))
     with RunWriter(tmp_path, "run") as writer:
         path = writer.write_config(cfg.to_dict())
