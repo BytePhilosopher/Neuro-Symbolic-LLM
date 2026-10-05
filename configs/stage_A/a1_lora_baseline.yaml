@@ -3,14 +3,14 @@
 adapter:
   rank: 16
   activation: identity  # identity | gelu | relu | tanh
-  alpha: null           # null → scale 1.0, else alpha / rank
-  init_std: null        # null → 1/sqrt(d)
-  late_start: null      # null → L//2 + 1
-  late_end: null        # null → L - 2
-  layers: null          # e.g. [6, 10]: explicit blocks; excludes late_start/late_end
+  alpha: null
+  init_std: null
+  late_start: null
+  late_end: null
+  layers: null
   seed: 0
 objective:
-  lambda_kl: 0.0        # [team] default, to be swept; KL is always logged
+  lambda_kl: 0.0
   lambda_wd: 0.0
 training:
   model: gpt2
@@ -24,25 +24,21 @@ training:
   reset_optimizer: true
   output_dir: runs
 # Three related legal domains (LexGLUE) trained in order: shared legal language,
-# different genres. Every domain is evaluated after every task to produce the
-# loss matrix, mean seen-task loss and mean forgetting that later stages are
-# compared against. Keep only the first domain for a single-domain run.
 domains:
-  # Legislation: EU laws and regulations (EUR-Lex).
   - name: eurlex
     dataset: coastalcph/lex_glue
     dataset_config: eurlex
     train_split: "train[:5000]"
     eval_split: "validation[:500]"
     separator: "\n\n"
-  # Contracts: provisions from SEC filings (LEDGAR).
+
   - name: ledgar
     dataset: coastalcph/lex_glue
     dataset_config: ledgar
     train_split: "train[:20000]"
     eval_split: "validation[:2000]"
     separator: "\n\n"
-  # Case law: US Supreme Court opinions (long documents, hence fewer rows).
+
   - name: scotus
     dataset: coastalcph/lex_glue
     dataset_config: scotus

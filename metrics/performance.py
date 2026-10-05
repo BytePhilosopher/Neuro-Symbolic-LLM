@@ -19,12 +19,10 @@ T = TypeVar("T")
 
 
 def cross_entropy_loss(logits: jax.Array, labels: jax.Array) -> jax.Array:
-    """Mean next-token cross-entropy; labels equal to ``-100`` are ignored."""
     return FrozenSubstrate.compute_loss(logits, labels)
 
 
 def kl_to_base(base_logits: jax.Array, adapted_logits: jax.Array) -> jax.Array:
-    """Return differentiable ``KL(p_base || p_adapted)``, averaged over positions."""
     # float32 log-space for stability; sum over vocab, mean over batch and positions.
     log_p = jax.nn.log_softmax(base_logits.astype(jnp.float32), axis=-1)
     log_q = jax.nn.log_softmax(adapted_logits.astype(jnp.float32), axis=-1)
@@ -47,13 +45,11 @@ def _task_matrix(acc: Any, t: int) -> jax.Array:
 
 
 def mean_seen_accuracy(acc: Any, t: int) -> jax.Array:
-    """Return ``mean_{j<=t} A[t, j]``, the mean metric over tasks seen so far."""
     a = _task_matrix(acc, t)
     return jnp.mean(a[t, : t + 1])
 
 
 def mean_forgetting(acc: Any, t: int, *, higher_is_better: bool = True) -> jax.Array:
-    """Return ``mean_{j<t}(best_{j<=s<t} A[s, j] - A[t, j])``; positive means forgetting."""
     a = _task_matrix(acc, t)
     if t == 0:
         raise ValueError("Forgetting is undefined at t=0: there are no earlier tasks.")
@@ -69,7 +65,6 @@ def mean_forgetting(acc: Any, t: int, *, higher_is_better: bool = True) -> jax.A
 def training_step_time(
     step_fn: Callable[..., T], *args: Any, **kwargs: Any
 ) -> tuple[T, float]:
-    """Run ``step_fn(*args, **kwargs)`` and return ``(output, seconds)``."""
     start = time.perf_counter()
     out = step_fn(*args, **kwargs)
     # JAX is async: wait for the outputs before stopping the timer.

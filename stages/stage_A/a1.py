@@ -19,8 +19,6 @@ from stages.stage_base import base_logits, checked_kwargs
 
 @dataclass(frozen=True)
 class A1Config:
-    """Objective weights; mirrors the ``objective:`` YAML section."""
-
     lambda_kl: float = 0.0
     lambda_wd: float = 0.0
 
@@ -45,7 +43,6 @@ def a1_objective(
     labels: jax.Array | None = None,
     base: jax.Array | None = None,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
-    """Return ``(total, terms)`` for one batch; ``kl`` is omitted if unweighted and no ``base``."""
     adapted = substrate.run_with_interception(
         input_ids,
         modify_fn=adapter.modify_fn(params),
@@ -62,7 +59,6 @@ def a1_objective(
         if base is None
         else jax.lax.stop_gradient(base)
     )
-    # Forward KL to the base keeps the adapted model near F0.
     kl = kl_to_base(base, adapted)
     total = task + config.lambda_kl * kl + config.lambda_wd * wd
     return total, {"total": total, "task": task, "kl": kl, "wd": wd}

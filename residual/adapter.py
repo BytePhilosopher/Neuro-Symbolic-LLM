@@ -91,12 +91,10 @@ class ResidualConfig:
 
     @property
     def scale(self) -> float:
-        """Residual scale ``s = alpha / r`` (``1.0`` if ``alpha`` is unset)."""
         return 1.0 if self.alpha is None else float(self.alpha) / self.rank
 
 
 def _checked_kwargs(cls: type, data: Mapping[str, Any]) -> dict[str, Any]:
-    # Private copy so residual/ does not depend on stages/.
     known = {f.name for f in fields(cls)}
     unknown = sorted(set(data) - known)
     if unknown:
@@ -134,8 +132,6 @@ def layer_key(layer_idx: int) -> str:
 
 
 class ResidualAdapter:
-    """Low-rank residual on frozen block outputs (late blocks or ``config.layers``)."""
-
     def __init__(self, config: ResidualConfig, architecture: Architecture) -> None:
         self.config = config
         self.architecture = architecture
@@ -150,7 +146,6 @@ class ResidualAdapter:
         )
         self.layers = validate_interception_layers(requested, architecture.num_layers)
         self.scale = config.scale
-        # 1/sqrt(d) keeps h @ A at roughly the per-feature scale of h.
         self.init_std = (
             config.init_std
             if config.init_std is not None
@@ -159,11 +154,9 @@ class ResidualAdapter:
         self._activation = ACTIVATIONS[config.activation]
 
     def init_params(self) -> AdapterParams:
-        """Return ``A ~ N(0, init_std^2)``, ``B = 0`` per block, seeded."""
         base = jax.random.PRNGKey(self.config.seed)
         d, r = self.hidden_size, self.config.rank
-        # Keys fold in the block index, so a block's A is stable if the range moves.
-        # B = 0 zeroes the residual while dL/dB stays non-zero.
+        # Keys fold in the block index, so a block's A is stable if the range moves. B = 0 zeroes the residual while dL/dB stays non-zero.
         return {
             layer_key(idx): {
                 "A": self.init_std
@@ -176,7 +169,6 @@ class ResidualAdapter:
         }
 
     def encode(self, layer_params: Mapping[str, jax.Array], h: jax.Array) -> jax.Array:
-        """Return the rank-``r`` code ``z = sigma(h @ A)`` in float32."""
         # Upcast so the bottleneck keeps precision on bf16/fp16 substrates.
         h32 = h.astype(jnp.float32)
         return self._activation(h32 @ layer_params["A"])
@@ -187,7 +179,6 @@ class ResidualAdapter:
     def residual(
         self, layer_params: Mapping[str, jax.Array], h: jax.Array
     ) -> jax.Array:
-        """Return ``decode(encode(h))`` in float32, not cast back."""
         return self.decode(layer_params, self.encode(layer_params, h))
 
     def apply(self, params: AdapterParams, h: jax.Array, layer_idx: int) -> jax.Array:
@@ -198,8 +189,6 @@ class ResidualAdapter:
         return h + self.residual(layer_params, h).astype(h.dtype)
 
     def modify_fn(self, params: AdapterParams) -> Callable[[jax.Array, int], jax.Array]:
-        """Return a substrate hook ``(hidden, layer_idx) -> hidden`` bound to ``params``."""
-
         # Closing over params (possibly tracers) lets jax.grad reach the adapter.
         def modify(hidden: jax.Array, layer_idx: int) -> jax.Array:
             return self.apply(params, hidden, layer_idx)

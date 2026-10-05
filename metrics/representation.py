@@ -20,7 +20,6 @@ def residual_compressibility(
     delta_large: jax.Array | float,
     eps: float = 1e-8,
 ) -> jax.Array:
-    """Return ``Δ(r_small) / (Δ(r_large) + eps)``; meaningful only if ``delta_large > 0``."""
     if eps < 0:
         raise ValueError(f"eps must be >= 0, got {eps!r}")
     return jnp.asarray(delta_small, jnp.float32) / (
@@ -31,7 +30,6 @@ def residual_compressibility(
 def compressibility_curve(
     deltas: Mapping[int, jax.Array | float], eps: float = 1e-8
 ) -> dict[int, jax.Array]:
-    """Return compressibility of each rank in ``{rank: Δ}`` relative to the largest rank."""
     if not deltas:
         raise ValueError("deltas is empty; expected at least one rank.")
     ranks = sorted(deltas)
