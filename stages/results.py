@@ -1,12 +1,4 @@
-"""Run artifacts shared by the stage runners; one fresh directory per run::
-
-    <root>/<run_name>/
-        config.yaml          resolved config; can be passed back to the runner
-        meta.json            git commit, dirty flag, library versions, start time
-        metrics.jsonl        one JSON object per line: train steps and evals
-        results.json         end-of-run summary, written by the runner
-        params/<tag>.npz     adapter parameters, keys "<layer>/<leaf>"
-
+"""Run artifacts shared by the stage runners; one fresh directory per run.
 JSON is written atomically and ``metrics.jsonl`` is flushed per line, so a
 crashed run never leaves a truncated file.
 """
@@ -69,7 +61,6 @@ def _git(*args: str) -> str | None:
 
 
 def run_metadata() -> dict[str, Any]:
-    """Return run provenance: commit, dirty flag, versions, argv, start time (UTC)."""
     versions: dict[str, str] = {}
     for name in ("jax", "jaxlib", "optax", "numpy", "torch", "transformers"):
         module = sys.modules.get(name)
@@ -94,8 +85,6 @@ def default_run_name(prefix: str) -> str:
 
 
 class RunWriter:
-    """Writes one run's artifacts to ``root / run_name``; use as a context manager."""
-
     def __init__(self, root: Path | str, run_name: str) -> None:
         if not run_name or Path(run_name).name != run_name:
             raise ValueError(
@@ -133,7 +122,6 @@ class RunWriter:
         return path
 
     def log(self, event: str, **fields: Any) -> None:
-        """Append ``{"event": event, **fields}`` as one line of ``metrics.jsonl``."""
         if self._metrics is None:
             raise RuntimeError("RunWriter is closed.")
         record = {"event": event, **_to_json(fields)}
@@ -141,7 +129,6 @@ class RunWriter:
         self._metrics.flush()
 
     def save_params(self, tag: str, params: Mapping[str, Mapping[str, Any]]) -> Path:
-        """Save a two-level parameter PyTree as ``params/<tag>.npz``."""
         flat = {
             f"{outer}/{inner}": np.asarray(leaf)
             for outer, leaves in params.items()
@@ -154,7 +141,6 @@ class RunWriter:
 
 
 def load_params(path: Path | str) -> dict[str, dict[str, np.ndarray]]:
-    """Load a checkpoint written by ``RunWriter.save_params``."""
     params: dict[str, dict[str, np.ndarray]] = {}
     with np.load(path) as data:
         for key in data.files:

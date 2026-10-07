@@ -100,8 +100,6 @@ class TrainingConfig:
 
 @dataclass(frozen=True)
 class DomainConfig:
-    """One ``domains:`` item; splits accept HF slicing, e.g. ``train[:20000]``."""
-
     name: str
     dataset: str
     dataset_config: str | None = None
@@ -129,8 +127,6 @@ class DomainConfig:
 
 @dataclass(frozen=True)
 class RunConfig:
-    """Full run config; mirrors the YAML file."""
-
     adapter: ResidualConfig
     # Stage objective config: any frozen dataclass with ``from_dict``.
     objective: Any
@@ -147,7 +143,6 @@ class RunConfig:
 
 
 def load_configs(path: Path, objective_cls: type[Any]) -> RunConfig:
-    """Parse a YAML file into a ``RunConfig``, building ``objective:`` with ``objective_cls``."""
     raw = yaml.safe_load(path.read_text()) or {}
     unknown = sorted(set(raw) - set(SECTIONS))
     if unknown:
@@ -180,7 +175,6 @@ class Domain:
 def load_token_blocks(
     substrate: FrozenSubstrate, domain: DomainConfig, split: str, seq_len: int
 ) -> np.ndarray:
-    """Tokenize a dataset split into contiguous ``[n, seq_len]`` blocks."""
     from datasets import load_dataset
 
     if substrate.tokenizer is None:
@@ -205,7 +199,6 @@ def load_token_blocks(
 def make_eval_set(
     blocks: np.ndarray, batch_size: int, eval_batches: int
 ) -> tuple[jax.Array, ...]:
-    """Return fixed, unshuffled eval batches."""
     n_eval = min(len(blocks), eval_batches * batch_size)
     return tuple(
         jnp.asarray(blocks[i : i + batch_size]) for i in range(0, n_eval, batch_size)
@@ -213,7 +206,6 @@ def make_eval_set(
 
 
 def batches(blocks: np.ndarray, batch_size: int, seed: int) -> Iterator[jax.Array]:
-    """Yield an endless, seeded stream of shuffled batches."""
     if len(blocks) < batch_size:
         raise ValueError(f"{len(blocks)} blocks cannot fill batch_size={batch_size}.")
     rng = np.random.default_rng(seed)
@@ -225,7 +217,6 @@ def batches(blocks: np.ndarray, batch_size: int, seed: int) -> Iterator[jax.Arra
 
 
 def base_logits(substrate: FrozenSubstrate, input_ids: jax.Array) -> jax.Array:
-    """Return base-model ``F0`` logits with gradients stopped."""
     # No intercept layers: a plain base forward.
     result = substrate.run_with_interception(
         input_ids, modify_fn=identity_modify, intercept_layers=()
@@ -239,7 +230,6 @@ def evaluate(
     params: AdapterParams,
     eval_batches: Sequence[jax.Array],
 ) -> dict[str, float]:
-    """Return mean base/adapted loss, perplexity and KL over ``eval_batches``."""
     base_losses, losses, kls = [], [], []
     for ids in eval_batches:
         base = base_logits(substrate, ids)
@@ -264,7 +254,6 @@ def summarize(
     init: Mapping[str, Mapping[str, float]],
     rows: Sequence[Mapping[str, Mapping[str, float]]],
 ) -> dict[str, Any]:
-    """Return ``[t][j]`` eval matrices, mean seen loss and mean forgetting."""
     loss = np.array([[row[n]["loss"] for n in names] for row in rows])
     base_loss = [init[n]["base_loss"] for n in names]
     num_tasks = len(rows)
@@ -303,7 +292,6 @@ def run_sequential(
     training: TrainingConfig,
     writer: RunWriter,
 ) -> tuple[AdapterParams, dict[str, Any]]:
-    """Train on ``domains`` in order, evaluating all after each task; return ``(params, summary)``."""
     if not domains:
         raise ValueError("At least one domain is required.")
     names = [d.name for d in domains]
