@@ -109,7 +109,6 @@ def resolve_late_layers(
     late_start: int | None = None,
     late_end: int | None = None,
 ) -> tuple[int, ...]:
-    """Return the adapted blocks ``(L // 2, L - 2]``; invalid bounds raise, never clamp."""
     l_mid = num_layers // 2
     start = l_mid + 1 if late_start is None else late_start
     end = num_layers - 2 if late_end is None else late_end

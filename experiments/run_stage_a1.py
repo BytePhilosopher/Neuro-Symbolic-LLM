@@ -2,8 +2,6 @@
 
 Wiring only: builds the configs, substrate and adapter, then runs the shared
 loop in ``stages/stage_base.py`` and checks the base is unchanged.
-
-    python experiments/run_stage_a1.py --config configs/stage_A/a1_lora_baseline.yaml
 """
 
 from __future__ import annotations
