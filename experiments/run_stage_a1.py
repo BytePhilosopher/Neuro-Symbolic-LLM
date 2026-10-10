@@ -7,6 +7,7 @@ loop in ``stages/stage_base.py`` and checks the base is unchanged.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from collections.abc import Sequence
@@ -25,6 +26,8 @@ from stages.stage_A.a1 import A1Config, a1_objective  # noqa: E402
 from stages.stage_base import (  # noqa: E402
     Domain,
     RunConfig,
+    evaluate,
+    evaluate_checkpoint,
     load_configs,
     load_token_blocks,
     make_eval_set,
@@ -46,6 +49,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--run-name", type=str, default=None)
+    parser.add_argument(
+        "--eval-checkpoint",
+        type=Path,
+        default=None,
+        help="Evaluate a saved checkpoint instead of training.",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="test",
+        help="Split to evaluate when using --eval-checkpoint (default: test).",
+    )
+    parser.add_argument(
+        "--eval-batches",
+        type=int,
+        default=None,
+        help="Override eval_batches setting.",
+    )
     return parser.parse_args(argv)
 
 
@@ -100,6 +121,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         log.error("Substrate not frozen before training: %s", frozen)
         return 1
 
+    if args.eval_checkpoint is not None:
+        log.info(
+            "Evaluating checkpoint %s on split=%s",
+            args.eval_checkpoint,
+            args.split,
+        )
+        eval_batches = args.eval_batches or train_cfg.eval_batches
+        results = evaluate_checkpoint(
+            substrate,
+            adapter,
+            args.eval_checkpoint,
+            cfg.domains,
+            split=args.split,
+            seq_len=train_cfg.seq_len,
+            batch_size=train_cfg.batch_size,
+            eval_batches=eval_batches,
+        )
+        print(json.dumps(results, indent=2))
+        return 0
+
     # Load data before creating the run directory, so bad datasets fail fast.
     domains = []
     for d in cfg.domains:
@@ -151,10 +192,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         frozen = substrate.verify_frozen()
         summary["params_unchanged"] = frozen["params_unchanged"]
+
+        # Final test-set evaluation across domains for paper-table results
+        test_eval_batches = args.eval_batches or train_cfg.eval_batches
+        test_results = {}
+        for d in cfg.domains:
+            test_blocks = load_token_blocks(
+                substrate, d, d.test_split, train_cfg.seq_len
+            )
+            test_set = make_eval_set(
+                test_blocks, train_cfg.batch_size, test_eval_batches
+            )
+            test_results[d.name] = evaluate(substrate, adapter, params, test_set)
+            writer.log("test", domain=d.name, **test_results[d.name])
+        summary["test"] = test_results
         writer.write_json("results.json", summary)
 
     log.info("mean_seen_loss=%s", summary["mean_seen_loss"])
     log.info("mean_forgetting=%s", summary["mean_forgetting"])
+    log.info("test_results=%s", summary["test"])
     log.info("verify_frozen=%s", frozen)
     if not frozen["params_unchanged"]:
         log.error("Base parameters changed during training.")

@@ -11,7 +11,7 @@ import re
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -19,7 +19,8 @@ import numpy as np
 import optax
 import yaml
 
-from frozenllm.substrate import FrozenSubstrate, identity_modify
+if TYPE_CHECKING:
+    from frozenllm.substrate import FrozenSubstrate
 from metrics.performance import (
     cross_entropy_loss,
     kl_to_base,
@@ -106,6 +107,7 @@ class DomainConfig:
     text_field: str = "text"
     train_split: str = "train"
     eval_split: str = "validation"
+    test_split: str = "test"
     # Joins rows into one stream; use "\n\n" for one-document-per-row datasets.
     separator: str = ""
     steps: int | None = None
@@ -217,6 +219,8 @@ def batches(blocks: np.ndarray, batch_size: int, seed: int) -> Iterator[jax.Arra
 
 
 def base_logits(substrate: FrozenSubstrate, input_ids: jax.Array) -> jax.Array:
+    from frozenllm.substrate import identity_modify
+
     # No intercept layers: a plain base forward.
     result = substrate.run_with_interception(
         input_ids, modify_fn=identity_modify, intercept_layers=()
@@ -247,6 +251,47 @@ def evaluate(
         "ppl": float(perplexity(loss)),
         "kl": float(np.mean(kls)),
     }
+
+
+def resolve_split(domain: DomainConfig, split: str) -> str:
+    """Map symbolic split name (test, eval/validation, train) to domain split string."""
+    if split == "test":
+        return domain.test_split
+    if split in ("eval", "validation"):
+        return domain.eval_split
+    if split == "train":
+        return domain.train_split
+    return split
+
+
+def evaluate_checkpoint(
+    substrate: FrozenSubstrate,
+    adapter: ResidualAdapter,
+    checkpoint: Path | str | Mapping[str, Mapping[str, Any]],
+    domains: Sequence[DomainConfig],
+    *,
+    split: str = "test",
+    seq_len: int = 128,
+    batch_size: int = 8,
+    eval_batches: int = 8,
+) -> dict[str, dict[str, float]]:
+    """Evaluate adapter checkpoint weights across domains on the specified split."""
+    from stages.results import load_params
+
+    raw: Mapping[str, Mapping[str, Any]] = (
+        load_params(checkpoint) if isinstance(checkpoint, str | Path) else checkpoint
+    )
+    params = {
+        outer: {inner: jnp.asarray(val) for inner, val in inner_dict.items()}
+        for outer, inner_dict in raw.items()
+    }
+    results = {}
+    for d in domains:
+        split_name = resolve_split(d, split)
+        blocks = load_token_blocks(substrate, d, split_name, seq_len)
+        eval_set = make_eval_set(blocks, batch_size, eval_batches)
+        results[d.name] = evaluate(substrate, adapter, params, eval_set)
+    return results
 
 
 def summarize(
@@ -365,7 +410,15 @@ def run_sequential(
                     _fmt_terms(scalars),
                     step_time,
                 )
-        writer.save_params(f"task_{t}_{domain.name}", params)
+        writer.save_checkpoint(
+            f"task_{t}_{domain.name}",
+            params,
+            opt_state=opt_state,
+            global_step=global_step,
+            task=t,
+            domain=domain.name,
+            step=domain.steps,
+        )
         rows.append(eval_all(t))
 
     summary = summarize(names, init, rows)
@@ -405,9 +458,11 @@ __all__ = [
     "batches",
     "checked_kwargs",
     "evaluate",
+    "evaluate_checkpoint",
     "load_configs",
     "load_token_blocks",
     "make_eval_set",
+    "resolve_split",
     "run_sequential",
     "summarize",
 ]

@@ -69,3 +69,39 @@ def test_metadata_and_run_name() -> None:
     meta = run_metadata()
     assert {"started_at", "git_commit", "git_dirty", "python", "versions"} <= set(meta)
     assert default_run_name("a1").startswith("a1-")
+
+
+def test_checkpoint_round_trip(tmp_path: Path) -> None:
+    import optax
+
+    from stages.results import load_checkpoint
+
+    params = {"layer_7": {"A": jnp.ones((4, 2)), "B": jnp.zeros((2, 4))}}
+    optimizer = optax.adam(1e-3)
+    opt_state = optimizer.init(params)
+
+    with RunWriter(tmp_path, "run") as writer:
+        ckpt_path = writer.save_checkpoint(
+            "task_0_eurlex",
+            params,
+            opt_state=opt_state,
+            global_step=42,
+            domain="eurlex",
+        )
+
+    # 1. load_checkpoint restores params, opt_state, and metadata
+    loaded_params, loaded_opt, meta = load_checkpoint(ckpt_path)
+    assert meta["global_step"] == 42
+    assert meta["domain"] == "eurlex"
+    np.testing.assert_array_equal(loaded_params["layer_7"]["A"], np.ones((4, 2)))
+    np.testing.assert_array_equal(loaded_params["layer_7"]["B"], np.zeros((2, 4)))
+    assert loaded_opt is not None
+
+    # Verify optimizer step works with restored opt_state
+    grads = {"layer_7": {"A": jnp.zeros((4, 2)), "B": jnp.zeros((2, 4))}}
+    updates, next_opt = optimizer.update(grads, loaded_opt, loaded_params)
+    assert next_opt is not None
+
+    # 2. Backwards-compatible load_params works on the checkpoint path too
+    params_only = load_params(ckpt_path)
+    np.testing.assert_array_equal(params_only["layer_7"]["A"], np.ones((4, 2)))

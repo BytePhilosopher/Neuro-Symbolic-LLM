@@ -139,19 +139,97 @@ class RunWriter:
         np.savez(path, **flat)
         return path
 
+    def save_checkpoint(
+        self,
+        tag: str,
+        params: Mapping[str, Mapping[str, Any]],
+        opt_state: Any | None = None,
+        **metadata: Any,
+    ) -> Path:
+        """Save adapter params, optax optimizer state, and training metadata."""
+        import pickle
+
+        import jax
+
+        flat: dict[str, Any] = {
+            f"params/{outer}/{inner}": np.asarray(leaf)
+            for outer, leaves in params.items()
+            for inner, leaf in leaves.items()
+        }
+        if opt_state is not None:
+            leaves, treedef = jax.tree_util.tree_flatten(opt_state)
+            for i, leaf in enumerate(leaves):
+                flat[f"opt/leaf_{i}"] = np.asarray(leaf)
+            flat["__opt_treedef__"] = np.frombuffer(
+                pickle.dumps(treedef), dtype=np.uint8
+            )
+        if metadata:
+            flat["__metadata__"] = np.array(json.dumps(_to_json(metadata)))
+
+        path = self.dir / "checkpoints" / f"{tag}.npz"
+        path.parent.mkdir(exist_ok=True)
+        np.savez(path, **flat)
+        # Also save standalone weights for backwards compatibility.
+        self.save_params(tag, params)
+        return path
+
 
 def load_params(path: Path | str) -> dict[str, dict[str, np.ndarray]]:
     params: dict[str, dict[str, np.ndarray]] = {}
     with np.load(path) as data:
         for key in data.files:
-            outer, inner = key.split("/", 1)
-            params.setdefault(outer, {})[inner] = data[key]
+            if key.startswith("__"):
+                continue
+            if key.startswith("params/"):
+                _, outer, inner = key.split("/", 2)
+                params.setdefault(outer, {})[inner] = data[key]
+            elif "/" in key and not key.startswith("opt/"):
+                outer, inner = key.split("/", 1)
+                params.setdefault(outer, {})[inner] = data[key]
     return params
+
+
+def load_checkpoint(
+    path: Path | str,
+) -> tuple[dict[str, dict[str, np.ndarray]], Any | None, dict[str, Any]]:
+    """Load adapter params, optax optimizer state, and metadata from a checkpoint."""
+    import pickle
+
+    import jax
+
+    params: dict[str, dict[str, np.ndarray]] = {}
+    opt_leaves: dict[int, np.ndarray] = {}
+    treedef = None
+    metadata: dict[str, Any] = {}
+
+    with np.load(path) as data:
+        for key in data.files:
+            if key == "__opt_treedef__":
+                treedef = pickle.loads(data[key].tobytes())
+            elif key == "__metadata__":
+                metadata = json.loads(str(data[key]))
+            elif key.startswith("params/"):
+                _, outer, inner = key.split("/", 2)
+                params.setdefault(outer, {})[inner] = data[key]
+            elif key.startswith("opt/leaf_"):
+                idx = int(key.split("opt/leaf_")[1])
+                opt_leaves[idx] = data[key]
+            elif "/" in key and not key.startswith("opt/"):
+                outer, inner = key.split("/", 1)
+                params.setdefault(outer, {})[inner] = data[key]
+
+    opt_state = None
+    if treedef is not None and opt_leaves:
+        ordered_leaves = [opt_leaves[i] for i in range(len(opt_leaves))]
+        opt_state = jax.tree_util.tree_unflatten(treedef, ordered_leaves)
+
+    return params, opt_state, metadata
 
 
 __all__ = [
     "RunWriter",
     "default_run_name",
+    "load_checkpoint",
     "load_params",
     "run_metadata",
 ]

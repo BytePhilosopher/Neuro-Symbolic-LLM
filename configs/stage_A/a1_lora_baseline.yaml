@@ -30,6 +30,7 @@ domains:
     dataset_config: eurlex
     train_split: "train[:5000]"
     eval_split: "validation[:500]"
+    test_split: "test[:500]"
     separator: "\n\n"
 
   - name: ledgar
@@ -37,6 +38,7 @@ domains:
     dataset_config: ledgar
     train_split: "train[:20000]"
     eval_split: "validation[:2000]"
+    test_split: "test[:2000]"
     separator: "\n\n"
 
   - name: scotus
@@ -44,4 +46,5 @@ domains:
     dataset_config: scotus
     train_split: "train[:500]"
     eval_split: "validation[:200]"
+    test_split: "test[:200]"
     separator: "\n\n"
